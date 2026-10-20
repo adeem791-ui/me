@@ -1,0 +1,137 @@
+name: Build portable KytyPS5 (Windows)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/windows-portable.yml'
+      - 'patches/**'
+      - 'README.md'
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Build, test and package Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - name: Check out patch project
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC environment (clang-cl)
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Retrieve pinned Kyty source and submodules
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          git clone https://github.com/KytyPS5/KytyPS5.git source
+          if ($LASTEXITCODE -ne 0) { throw "Upstream clone failed" }
+          git -C source checkout 7b7f9a7
+          if ($LASTEXITCODE -ne 0) { throw "Pinned commit not available" }
+          git -C source submodule update --init --recursive
+          if ($LASTEXITCODE -ne 0) { throw "Failed to retrieve submodules" }
+
+      - name: Apply experimental stack-overflow fix
+        shell: pwsh
+        run: |
+          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/CollectScalarRead-stack-overflow.patch'
+          git -C source apply --check $patch
+          if ($LASTEXITCODE -ne 0) { throw "Patch validation failed" }
+          git -C source apply $patch
+          if ($LASTEXITCODE -ne 0) { throw "Patch application failed" }
+
+      - name: Locate vcpkg
+        id: vcpkg
+        shell: pwsh
+        run: |
+          $root = Split-Path (Get-Command vcpkg -ErrorAction Stop).Source
+          "root=$root" >> $env:GITHUB_OUTPUT
+
+      - name: Install glslang tools
+        shell: pwsh
+        run: |
+          vcpkg install 'glslang[tools,opt]:x64-windows'
+          if ($LASTEXITCODE -ne 0) { throw "glslang install failed" }
+          $path = Join-Path '${{ steps.vcpkg.outputs.root }}' 'installed/x64-windows/tools/glslang'
+          if (!(Test-Path (Join-Path $path 'glslangValidator.exe'))) { throw "glslangValidator.exe missing" }
+          $path >> $env:GITHUB_PATH
+
+      - name: Install Qt 6 for original launcher
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.10.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Configure with clang-cl
+        shell: cmd
+        run: |
+          cmake -S source -B build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DKYTY_BUILD_ORIGIN=Source ^
+            -DCMAKE_C_COMPILER=clang-cl ^
+            -DCMAKE_CXX_COMPILER=clang-cl ^
+            -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+
+      - name: Compile launcher, emulator and shader tests
+        shell: cmd
+        run: |
+          cmake --build build --target launcher resource_tracking_tests scalar_provenance_tests --parallel 8
+
+      - name: Run shader regression tests
+        shell: cmd
+        run: |
+          ctest --test-dir build --output-on-failure -R "^(resource_tracking|scalar_provenance)$"
+
+      - name: Install portable app and assets
+        shell: cmd
+        run: |
+          cmake --install build --prefix install
+
+      - name: Bundle MSVC runtime and verify output
+        shell: pwsh
+        run: |
+          $dest = Join-Path $env:GITHUB_WORKSPACE 'install'
+          foreach ($name in @('kyty_launcher.exe','kyty_emulator.exe','Qt6Core.dll','libwinpthread-1.dll')) {
+            if (!(Test-Path (Join-Path $dest $name))) { throw "Portable package missing $name" }
+          }
+          if (!(Test-Path (Join-Path $dest 'platforms/qwindows.dll'))) { throw "Qt Windows platform plugin missing" }
+          $crt = if ($env:VCToolsRedistDir) { Join-Path $env:VCToolsRedistDir 'x64/Microsoft.VC143.CRT' } else { '' }
+          if (!(Test-Path $crt)) {
+            $found = @(Get-ChildItem 'C:/Program Files/Microsoft Visual Studio/2022' -Filter Microsoft.VC143.CRT -Directory -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'x64' })
+            if ($found.Count) { $crt = $found[0].FullName }
+          }
+          if (!(Test-Path $crt)) { throw "MSVC runtime folder missing; refusing to publish incomplete portable package" }
+          Copy-Item (Join-Path $crt '*.dll') $dest -Force
+          foreach ($name in @('vcruntime140.dll','msvcp140.dll')) {
+            if (!(Test-Path (Join-Path $dest $name))) { throw "Runtime DLL missing: $name" }
+          }
+          Copy-Item 'source/LICENSE' (Join-Path $dest 'LICENSE_KytyPS5.txt')
+          Copy-Item 'patches/CollectScalarRead-stack-overflow.patch' (Join-Path $dest 'CollectScalarRead-stack-overflow.patch')
+          @'
+          Experimental unofficial KytyPS5 Windows build based on source at 7b7f9a7.
+          Open kyty_launcher.exe after unzipping; keep all runtime DLLs and assets together.
+          Requires Windows x64 and Vulkan-capable graphics drivers.
+          No development software should be required to run the finished package.
+          Shader stack overflow patch is experimental and game compatibility is not guaranteed.
+          Refer to this repository for the patch and corresponding upstream source.
+          '@ | Set-Content (Join-Path $dest 'START_HERE.txt') -Encoding UTF8
+
+      - name: Archive portable Windows application
+        shell: pwsh
+        run: |
+          Compress-Archive -Path 'install/*' -DestinationPath "$env:RUNNER_TEMP/KytyPS5-Portable-Windows-StackFix.zip" -CompressionLevel Optimal
+
+      - name: Upload compiled Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Portable-Windows-StackFix
+          path: ${{ runner.temp }}/KytyPS5-Portable-Windows-StackFix.zip
+          if-no-files-found: error
+          retention-days: 14
