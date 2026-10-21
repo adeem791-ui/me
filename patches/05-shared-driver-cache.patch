@@ -11,7 +11,7 @@
 +	// Optional shared driver cache across successive portable ZIP extractions.
 +	// The file's existing driver UUID/version and checksum validation still applies.
 +	// This stores only Vulkan driver cache data, not proprietary guest shader inputs.
-+	if (const char* root = std::getenv("KYTY_PIPELINE_CACHE_DIR"); root != nullptr && root[0] != '\\0') {
++	if (const char* root = std::getenv("KYTY_PIPELINE_CACHE_DIR"); root != nullptr && root[0] != 0) {
 +		const std::filesystem::path directory(root);
 +		if (directory.is_absolute()) {
 +			m_driver_cache_path = directory / (title_id + ".bin");
