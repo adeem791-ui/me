@@ -1,0 +1,144 @@
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
+@@ -96,6 +96,8 @@
+ struct ShaderProgram {
+ 	uint64_t         id     = 0;
+ 	vk::ShaderModule module = nullptr;
++	uint64_t         shader_hash = 0;
++	uint32_t         spirv_words = 0;
+ 
+ 	explicit operator bool() const { return id != 0 && module != nullptr; }
+ };
+@@ -195,7 +197,7 @@
+                             vk::PipelineCache                      driver_cache);
+ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                             const ShaderComputeInputInfo& input_info,
+-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
++                            const ShaderProgram& compute_program, vk::PipelineCache driver_cache);
+ 
+ } // namespace Libs::Graphics
+ 
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+@@ -28,6 +28,7 @@
+ #include <chrono>
+ #include <cstdio>
+ #include <cstring>
++#include <cstdlib>
+ #include <fmt/format.h>
+ #include <limits>
+ #include <span>
+@@ -325,7 +326,9 @@
+ 		    .function_code  = {function_code.begin(), function_code.end()},
+ 		    .specialization = std::move(specialization),
+ 		    .program        = std::move(result.program).TakeCompiledInfo(),
+-		    .handle         = {.id = ++next_shader_id, .module = module},
++		    .handle         = {.id = ++next_shader_id, .module = module,
++		                       .shader_hash = options.shader_hash,
++		                       .spirv_words = static_cast<uint32_t>(result.spirv.size())},
+ 		};
+ 	}
+ 
+@@ -343,6 +346,22 @@
+ 		}
+ 
+ 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
++		// Diagnostic only: allow users to verify that the known Yotei compute pipeline
++		// is the render-thread blocker. Missing this dispatch can break rendering;
++		// never enable it by default or silently for other shaders.
++		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
++			const char* skip = std::getenv("KYTY_DIAGNOSTIC_SKIP_YOTEI_CS");
++			if (params.hash == 0xbe2f5f42f6b7c531ULL && skip != nullptr &&
++			    std::strcmp(skip, "1") == 0) {
++				static bool warned = false;
++				if (!warned) {
++					warned = true;
++					PipelineCacheLog("Yotei diagnostic: skipping CS 0xbe2f5f42f6b7c531; "
++					                 "visuals may be incorrect. Do not use for normal gameplay.");
++				}
++				return {};
++			}
++		}
+ 		lookup_key.stage           = stage;
+ 		lookup_key.hash            = params.hash;
+ 		lookup_key.user_data_count = params.user_data_count;
+@@ -1058,8 +1077,7 @@
+ 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
+ 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
+ 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+-		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
+-		                       m_driver_cache);
++		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program, m_driver_cache);
+ 	}
+ 
+ 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+--- a/src/graphics/host_gpu/renderer/pipeline/shaders.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/shaders.cpp
+@@ -21,6 +21,9 @@
+ #include <algorithm>
+ #include <array>
+ #include <bit>
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
+ #include <limits>
+ #include <span>
+ #include <vector>
+@@ -594,13 +597,13 @@
+ // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                             const ShaderComputeInputInfo& input_info,
+-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache) {
+-	EXIT_IF(compute_module == nullptr);
++                            const ShaderProgram& compute_program, vk::PipelineCache driver_cache) {
++	EXIT_IF(!compute_program);
+ 
+ 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
+ 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
+ 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
+-	comp_shader_stage_info.module = compute_module;
++	comp_shader_stage_info.module = compute_program.module;
+ 	comp_shader_stage_info.pName  = "main";
+ 	EXIT_IF(!input_info.stage);
+ 	const auto wave_size = input_info.stage.program->wave_size;
+@@ -643,14 +646,36 @@
+ 	info.layout            = pipeline.pipeline_layout;
+ 	info.basePipelineIndex = -1;
+ 
++	// A huge Yotei compute shader (~407k SPIR-V words) repeatedly gets stuck
++	// in driver pipeline compilation. DISABLE_OPTIMIZATION is a Vulkan core
++	// *hint*, not a timeout; it keeps shader semantics intact but can trade
++	// runtime performance for a much shorter driver compilation path.
++	// Only try it on very large compute shaders; allow safe A/B rollback.
++	constexpr uint32_t LargeComputeShaderWords = 262144;
++	const char* fast_compile_env = std::getenv("KYTY_LARGE_CS_FAST_COMPILE");
++	const bool fast_compile_enabled = fast_compile_env == nullptr ||
++	                                  std::strcmp(fast_compile_env, "0") != 0;
++	const bool fast_compile = fast_compile_enabled &&
++	                          compute_program.spirv_words >= LargeComputeShaderWords;
++	if (fast_compile) {
++		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
++	}
++
+ 	EXIT_IF(pipeline.pipeline != nullptr);
+ 
+-	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
+-	     static_cast<void*>(pipeline.pipeline_layout));
++	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p shader=0x%016" PRIx64
++	     " spirv_words=%u disable_optimization=%u\n",
++	     static_cast<void*>(pipeline.pipeline_layout), compute_program.shader_hash,
++	     compute_program.spirv_words, fast_compile ? 1u : 0u);
++	const auto pipeline_start = std::chrono::steady_clock::now();
+ 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
+ 	                                                &pipeline.pipeline);
+-	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
+-	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
++	const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++	    std::chrono::steady_clock::now() - pipeline_start).count();
++	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p shader=0x%016" PRIx64
++	     " elapsed_ms=%" PRId64 "\n",
++	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline),
++	     compute_program.shader_hash, static_cast<int64_t>(elapsed_ms));
+ 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+ 
+ 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
