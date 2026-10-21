@@ -62,6 +62,15 @@ jobs:
           git -C source apply $patch
           if ($LASTEXITCODE -ne 0) { throw "VRAM-pressure patch application failed" }
 
+      - name: Apply transient shader resource recovery
+        shell: pwsh
+        run: |
+          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/04-materialization-recovery.patch'
+          git -C source apply --check $patch
+          if ($LASTEXITCODE -ne 0) { throw "Materialization patch validation failed" }
+          git -C source apply $patch
+          if ($LASTEXITCODE -ne 0) { throw "Materialization patch application failed" }
+
       - name: Locate vcpkg
         id: vcpkg
         shell: pwsh
@@ -134,6 +143,7 @@ jobs:
           Copy-Item 'patches/CollectScalarRead-stack-overflow.patch' (Join-Path $dest 'CollectScalarRead-stack-overflow.patch')
           Copy-Item 'patches/02-large-compute-fast-compile.patch' (Join-Path $dest '02-large-compute-fast-compile.patch')
           Copy-Item 'patches/03-vram-pressure-gc.patch' (Join-Path $dest '03-vram-pressure-gc.patch')
+          Copy-Item 'patches/04-materialization-recovery.patch' (Join-Path $dest '04-materialization-recovery.patch')
           @'
           @echo off
           cd /d "%~dp0"
