@@ -12,22 +12,21 @@
  #include "graphics/shader/recompiler/ShaderRecompiler.h"
  #include "graphics/shader/shaderCompiler.h"
  #include "kernel/memory.h"
-@@ -24,10 +25,14 @@
+@@ -24,10 +25,13 @@
  #include <algorithm>
  #include <array>
  #include <atomic>
  #include <cctype>
  #include <chrono>
 +#include <bit>
-+#include <cstdlib>
 +#include <filesystem>
 +#include <fstream>
  #include <cstdio>
  #include <cstring>
+ #include <cstdlib>
  #include <fmt/format.h>
  #include <limits>
- #include <span>
-@@ -40,10 +45,34 @@
+@@ -41,10 +45,34 @@
  namespace Libs::Graphics {
  
  namespace {
@@ -62,7 +61,7 @@
  	switch (static_cast<Prospero::BlendFactor>(factor)) {
  		case Prospero::BlendFactor::kSrcAlpha:
  			return static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Alpha);
-@@ -313,21 +342,40 @@
+@@ -314,21 +342,40 @@
  			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
  			     options.shader_hash);
  		}
@@ -97,14 +96,14 @@
  		    .function_code  = {function_code.begin(), function_code.end()},
  		    .specialization = std::move(specialization),
  		    .program        = std::move(result.program).TakeCompiledInfo(),
--		    .handle         = {.id = ++next_shader_id, .module = module},
-+		    .handle         = {.id = shader_id, .module = module},
+-		    .handle         = {.id = ++next_shader_id, .module = module,
++		    .handle         = {.id = shader_id, .module = module,
+ 		                       .shader_hash = options.shader_hash,
+ 		                       .spirv_words = static_cast<uint32_t>(result.spirv.size())},
  		};
  	}
  
- 	template <typename InputInfo>
- 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
-@@ -490,10 +538,11 @@
+@@ -493,10 +540,11 @@
  				graphics.device.destroyShaderModule(permutation.handle.module, nullptr);
  			}
  		}
@@ -116,7 +115,7 @@
  	GraphicContext&                                             graphics;
  	uint64_t                                                    next_shader_id = 0;
  };
-@@ -1063,10 +1112,60 @@
+@@ -1065,10 +1113,60 @@
  	}
  
  	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
