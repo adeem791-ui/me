@@ -1,0 +1,431 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 84c8ec83..2fcb4712 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -450,6 +450,12 @@ add_executable(lru_cache_tests EXCLUDE_FROM_ALL
+ )
+ target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
+ 
++add_executable(driver_cache_file_tests EXCLUDE_FROM_ALL
++	"${KYTY_TESTS_DIR}/DriverCacheFileTests.cpp"
++)
++target_link_libraries(driver_cache_file_tests xxhash)
++target_include_directories(driver_cache_file_tests PRIVATE ${inc_headers})
++
+ add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
+ 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
+ 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
+@@ -637,6 +643,7 @@ if(BUILD_TESTING)
+ 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
+ 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+ 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
++	add_test(NAME driver_cache_file COMMAND $<TARGET_FILE:driver_cache_file_tests>)
+ 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
+ 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
+ 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
+diff --git a/src/graphics/host_gpu/renderer/pipeline/driverCacheFile.h b/src/graphics/host_gpu/renderer/pipeline/driverCacheFile.h
+new file mode 100644
+index 00000000..2c59b423
+--- /dev/null
++++ b/src/graphics/host_gpu/renderer/pipeline/driverCacheFile.h
+@@ -0,0 +1,111 @@
++#ifndef GRAPHICS_HOST_GPU_RENDERER_PIPELINE_DRIVER_CACHE_FILE_H_
++#define GRAPHICS_HOST_GPU_RENDERER_PIPELINE_DRIVER_CACHE_FILE_H_
++
++// On-disk format of the persistent Vulkan pipeline cache (_PipelineCache/<TITLE>.bin):
++//
++//   "KytyPC2:<vendor>:<device>:<driver>:<pipelineCacheUUID>\n"   text signature
++//   uint64_t XXH3_64bits(payload)                                 native byte order
++//   payload                                                       vkGetPipelineCacheData()
++//
++// Kept free of Vulkan and file I/O so the format can be tested without a GPU.
++
++#include <xxhash.h>
++
++#include <array>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <limits>
++#include <span>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace Libs::Graphics::DriverCacheFile {
++
++constexpr std::string_view SignatureTag = "KytyPC2:";
++
++struct DeviceIdentity {
++	uint32_t                 vendor_id      = 0;
++	uint32_t                 device_id      = 0;
++	uint32_t                 driver_version = 0;
++	std::array<uint8_t, 16> pipeline_cache_uuid {};
++};
++
++enum class Status {
++	Valid,
++	TooSmall,          // truncated or empty file
++	TooLarge,          // larger than the reader supports
++	FormatMismatch,    // not a Kyty cache file, or an older/newer format
++	DeviceMismatch,    // different GPU, driver version or driver cache UUID
++	PayloadCorrupted,  // signature matches, payload hash does not
++};
++
++inline const char* StatusName(Status status) {
++	switch (status) {
++		case Status::Valid: return "valid";
++		case Status::TooSmall: return "file too small";
++		case Status::TooLarge: return "file too large";
++		case Status::FormatMismatch: return "unknown file format";
++		case Status::DeviceMismatch: return "GPU or driver changed";
++		case Status::PayloadCorrupted: return "payload checksum mismatch";
++	}
++	return "unknown";
++}
++
++inline std::string Signature(const DeviceIdentity& identity) {
++	std::string uuid;
++	uuid.reserve(identity.pipeline_cache_uuid.size() * 2);
++	constexpr char hex[] = "0123456789abcdef";
++	for (const uint8_t byte: identity.pipeline_cache_uuid) {
++		uuid.push_back(hex[byte >> 4u]);
++		uuid.push_back(hex[byte & 0xfu]);
++	}
++	char ids[32] = {};
++	std::snprintf(ids, sizeof(ids), "%08x:%08x:%08x:", identity.vendor_id, identity.device_id,
++	              identity.driver_version);
++	return std::string(SignatureTag) + ids + uuid + "\n";
++}
++
++inline std::vector<uint8_t> Encode(std::string_view signature, std::span<const uint8_t> payload) {
++	const uint64_t       hash = XXH3_64bits(payload.data(), payload.size());
++	std::vector<uint8_t> file(signature.size() + sizeof(hash) + payload.size());
++	std::memcpy(file.data(), signature.data(), signature.size());
++	std::memcpy(file.data() + signature.size(), &hash, sizeof(hash));
++	if (!payload.empty()) {
++		std::memcpy(file.data() + signature.size() + sizeof(hash), payload.data(), payload.size());
++	}
++	return file;
++}
++
++// Parses a whole cache file. On Valid, `payload` holds the driver data; otherwise it is cleared.
++inline Status Decode(std::string_view expected_signature, std::span<const uint8_t> file,
++                     std::vector<uint8_t>* payload) {
++	payload->clear();
++	const size_t header_size = expected_signature.size() + sizeof(uint64_t);
++	if (file.size() > std::numeric_limits<uint32_t>::max()) {
++		return Status::TooLarge;
++	}
++	if (file.size() < header_size) {
++		return Status::TooSmall;
++	}
++	const std::string_view signature(reinterpret_cast<const char*>(file.data()),
++	                                 expected_signature.size());
++	if (signature != expected_signature) {
++		const bool same_tag =
++		    expected_signature.starts_with(SignatureTag) && signature.starts_with(SignatureTag);
++		return same_tag ? Status::DeviceMismatch : Status::FormatMismatch;
++	}
++	uint64_t stored_hash = 0;
++	std::memcpy(&stored_hash, file.data() + expected_signature.size(), sizeof(stored_hash));
++	const auto data = file.subspan(header_size);
++	if (XXH3_64bits(data.data(), data.size()) != stored_hash) {
++		return Status::PayloadCorrupted;
++	}
++	payload->assign(data.begin(), data.end());
++	return Status::Valid;
++}
++
++} // namespace Libs::Graphics::DriverCacheFile
++
++#endif // GRAPHICS_HOST_GPU_RENDERER_PIPELINE_DRIVER_CACHE_FILE_H_
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+index fe81f3e2..78214a72 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+@@ -14,6 +14,7 @@
+ #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+ #include "graphics/host_gpu/renderer/image/imageView.h"
+ #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
++#include "graphics/host_gpu/renderer/pipeline/driverCacheFile.h"
+ #include "graphics/host_gpu/renderer/render.h"
+ #include "graphics/host_gpu/renderer/renderContext.h"
+ #include "graphics/shader/recompiler/ShaderRecompiler.h"
+@@ -77,15 +78,14 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
+ }
+ 
+ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
+-	constexpr char hex[] = "0123456789abcdef";
+-	std::string    uuid(VK_UUID_SIZE * 2, '0');
+-	for (size_t i = 0; i < VK_UUID_SIZE; i++) {
+-		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
+-		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
+-	}
++	DriverCacheFile::DeviceIdentity identity {.vendor_id      = properties.vendorID,
++	                                          .device_id      = properties.deviceID,
++	                                          .driver_version = properties.driverVersion};
++	static_assert(VK_UUID_SIZE == std::tuple_size_v<decltype(identity.pipeline_cache_uuid)>);
++	std::memcpy(identity.pipeline_cache_uuid.data(), properties.pipelineCacheUUID.data(),
++	            VK_UUID_SIZE);
+ 	// Driver cache entries already distinguish shader code and pipeline state across builds.
+-	return fmt::format("KytyPC2:{:08x}:{:08x}:{:08x}:{}\n",
+-	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
++	return DriverCacheFile::Signature(identity);
+ }
+ 
+ std::string PipelineCacheTitleId() {
+@@ -578,6 +578,9 @@ void PipelineCache::InitializeDriverCache() {
+ 		const std::filesystem::path directory(root);
+ 		if (directory.is_absolute()) {
+ 			m_driver_cache_path = directory / (title_id + ".bin");
++		} else {
++			PipelineCacheLog("Vulkan pipeline cache: ignoring KYTY_PIPELINE_CACHE_DIR={} (not an absolute path)",
++			                 root);
+ 		}
+ 	}
+ 	const auto path         = Common::PathToString(m_driver_cache_path);
+@@ -589,34 +592,33 @@ void PipelineCache::InitializeDriverCache() {
+ 	}
+ 	std::vector<uint8_t> initial_data;
+ 	if (cache_exists) {
++		const auto load_begin = std::chrono::steady_clock::now();
+ 		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
+-		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
+-		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+-		if (file_size >= signature.size() + sizeof(uint64_t) &&
+-		    file_size <= std::numeric_limits<uint32_t>::max()) {
+-			std::string cached_signature(signature.size(), '\0');
+-			uint64_t    payload_hash = 0;
+-			initial_data.resize(file_size - signature.size() - sizeof(payload_hash));
+-			uint32_t signature_read = 0;
+-			uint32_t hash_read      = 0;
+-			uint32_t payload_read   = 0;
+-			file.Read(cached_signature.data(), static_cast<uint32_t>(cached_signature.size()),
+-			          &signature_read);
+-			file.Read(&payload_hash, sizeof(payload_hash), &hash_read);
+-			file.Read(initial_data.data(), static_cast<uint32_t>(initial_data.size()),
+-			          &payload_read);
+-			file.Close();
+-			if (signature_read != cached_signature.size() || hash_read != sizeof(payload_hash) ||
+-			    payload_read != initial_data.size() || cached_signature != signature ||
+-			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
+-				initial_data.clear();
+-				PipelineCacheLog(
+-				    "Vulkan pipeline cache: invalidating {} (driver or data mismatch)",
+-				    path);
+-			}
++		const uint64_t file_size = file.IsInvalid() ? 0 : file.Size();
++		std::vector<uint8_t> file_data;
++		uint32_t             file_read = 0;
++		if (file_size <= std::numeric_limits<uint32_t>::max()) {
++			file_data.resize(file_size);
++			file.Read(file_data.data(), static_cast<uint32_t>(file_data.size()), &file_read);
++		}
++		file.Close();
++		auto status = DriverCacheFile::Status::TooLarge;
++		if (file_size <= std::numeric_limits<uint32_t>::max()) {
++			file_data.resize(file_read);
++			status = DriverCacheFile::Decode(
++			    DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties()), file_data,
++			    &initial_data);
++		}
++		const auto load_ms = std::chrono::duration<double, std::milli>(
++		                         std::chrono::steady_clock::now() - load_begin)
++		                         .count();
++		if (status != DriverCacheFile::Status::Valid) {
++			PipelineCacheLog("Vulkan pipeline cache: invalidating {} ({}, {:.2f} MB, {:.1f} ms)",
++			                 path, DriverCacheFile::StatusName(status),
++			                 static_cast<double>(file_size) / 1'000'000.0, load_ms);
+ 		} else {
+-			file.Close();
+-			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size)", path);
++			PipelineCacheLog("Vulkan pipeline cache: read and verified {:.2f} MB in {:.1f} ms",
++			                 static_cast<double>(file_size) / 1'000'000.0, load_ms);
+ 		}
+ 	}
+ 
+@@ -684,9 +686,8 @@ void PipelineCache::Save() {
+ 		return;
+ 	}
+ 	payload.resize(size);
+-	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+-	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
+-	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
++	const auto encoded = DriverCacheFile::Encode(
++	    DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties()), payload);
+ 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
+ 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
+ 		return;
+@@ -694,15 +695,13 @@ void PipelineCache::Save() {
+ 	auto temp_path = m_driver_cache_path;
+ 	temp_path += ".tmp";
+ 	Common::File file;
+-	uint32_t     prefix_written  = 0;
+-	uint32_t     payload_written = 0;
+-	if (file.Create(temp_path)) {
+-		file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
+-		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
++	uint32_t     written_size = 0;
++	if (encoded.size() <= std::numeric_limits<uint32_t>::max() && file.Create(temp_path)) {
++		file.Write(encoded.data(), static_cast<uint32_t>(encoded.size()), &written_size);
+ 	}
+ 	const bool flushed = !file.IsInvalid() && file.Flush();
+ 	file.Close();
+-	const bool written = prefix_written == prefix.size() && payload_written == payload.size() && flushed;
++	const bool written = written_size == encoded.size() && flushed;
+ 	std::error_code error;
+ 	if (written) {
+ 		std::filesystem::rename(temp_path, m_driver_cache_path, error);
+diff --git a/tests/DriverCacheFileTests.cpp b/tests/DriverCacheFileTests.cpp
+new file mode 100644
+index 00000000..edf6fbc3
+--- /dev/null
++++ b/tests/DriverCacheFileTests.cpp
+@@ -0,0 +1,146 @@
++#include "graphics/host_gpu/renderer/pipeline/driverCacheFile.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++// Deterministic tests for the persistent Vulkan pipeline cache file format.
++// No GPU, Vulkan loader or game data is needed.
++
++namespace {
++
++using namespace Libs::Graphics::DriverCacheFile;
++
++void Check(bool value, const char* message) {
++	if (!value) {
++		std::fprintf(stderr, "DriverCacheFileTests: failed: %s\n", message);
++		std::abort();
++	}
++}
++
++DeviceIdentity TestDevice() {
++	DeviceIdentity identity {.vendor_id = 0x10de, .device_id = 0x2c02, .driver_version = 0x91f40000};
++	for (uint8_t i = 0; i < identity.pipeline_cache_uuid.size(); i++) {
++		identity.pipeline_cache_uuid[i] = static_cast<uint8_t>(i * 17);
++	}
++	return identity;
++}
++
++std::vector<uint8_t> TestPayload(size_t size) {
++	std::vector<uint8_t> payload(size);
++	for (size_t i = 0; i < size; i++) {
++		payload[i] = static_cast<uint8_t>((i * 31u + 7u) & 0xffu);
++	}
++	return payload;
++}
++
++void TestSignatureLayout() {
++	const auto signature = Signature(TestDevice());
++	Check(signature ==
++	          "KytyPC2:000010de:00002c02:91f40000:00112233445566778899aabbccddeeff\n",
++	      "signature text changed; existing caches would be invalidated");
++}
++
++void TestRoundTrip() {
++	const auto signature = Signature(TestDevice());
++	for (size_t size: {size_t {0}, size_t {1}, size_t {4096}, size_t {1u << 20}}) {
++		const auto payload = TestPayload(size);
++		const auto file    = Encode(signature, payload);
++		Check(file.size() == signature.size() + sizeof(uint64_t) + payload.size(),
++		      "encoded size is signature + hash + payload");
++		std::vector<uint8_t> decoded {1, 2, 3};
++		Check(Decode(signature, file, &decoded) == Status::Valid, "round trip is valid");
++		Check(decoded == payload, "round trip preserves payload");
++	}
++}
++
++// Byte layout must match files written by the pre-refactor Save().
++void TestLegacyLayoutCompatible() {
++	const auto signature = Signature(TestDevice());
++	const auto payload   = TestPayload(333);
++	std::string legacy   = signature;
++	const uint64_t hash  = XXH3_64bits(payload.data(), payload.size());
++	legacy.append(reinterpret_cast<const char*>(&hash), sizeof(hash));
++	legacy.append(reinterpret_cast<const char*>(payload.data()), payload.size());
++	const auto file = Encode(signature, payload);
++	Check(file.size() == legacy.size() && std::memcmp(file.data(), legacy.data(), legacy.size()) == 0,
++	      "Encode differs from the legacy byte layout");
++}
++
++void TestTruncated() {
++	const auto signature = Signature(TestDevice());
++	const auto file      = Encode(signature, TestPayload(64));
++	std::vector<uint8_t> decoded;
++	Check(Decode(signature, std::span(file).first(0), &decoded) == Status::TooSmall, "empty file");
++	Check(Decode(signature, std::span(file).first(signature.size() + 3), &decoded) == Status::TooSmall,
++	      "truncated header");
++	// Truncated payload keeps a valid header, so the checksum catches it.
++	Check(Decode(signature, std::span(file).first(file.size() - 1), &decoded) ==
++	          Status::PayloadCorrupted,
++	      "truncated payload");
++	Check(decoded.empty(), "payload cleared on failure");
++}
++
++void TestCorruptPayload() {
++	const auto signature = Signature(TestDevice());
++	auto       file      = Encode(signature, TestPayload(256));
++	file[file.size() / 2 + signature.size()] ^= 0x40u;
++	std::vector<uint8_t> decoded;
++	Check(Decode(signature, file, &decoded) == Status::PayloadCorrupted, "flipped payload bit");
++	Check(decoded.empty(), "corrupt payload is not returned");
++}
++
++void TestDriverUpdateInvalidates() {
++	auto       old_device = TestDevice();
++	const auto file       = Encode(Signature(old_device), TestPayload(128));
++	std::vector<uint8_t> decoded;
++
++	auto driver_update = old_device;
++	driver_update.driver_version++;
++	Check(Decode(Signature(driver_update), file, &decoded) == Status::DeviceMismatch,
++	      "driver version change");
++
++	auto uuid_change = old_device;
++	uuid_change.pipeline_cache_uuid[15] ^= 1u;
++	Check(Decode(Signature(uuid_change), file, &decoded) == Status::DeviceMismatch,
++	      "pipelineCacheUUID change");
++
++	auto new_gpu = old_device;
++	new_gpu.device_id = 0x2684;
++	Check(Decode(Signature(new_gpu), file, &decoded) == Status::DeviceMismatch, "GPU change");
++}
++
++void TestForeignFile() {
++	const auto signature = Signature(TestDevice());
++	std::vector<uint8_t> file(signature.size() + 64, 0);
++	std::memcpy(file.data(), "KytyPC1:", 8);
++	std::vector<uint8_t> decoded;
++	Check(Decode(signature, file, &decoded) == Status::FormatMismatch, "older format tag");
++	std::memset(file.data(), 'x', signature.size());
++	Check(Decode(signature, file, &decoded) == Status::FormatMismatch, "random file");
++}
++
++void TestStatusNames() {
++	for (auto status: {Status::Valid, Status::TooSmall, Status::TooLarge, Status::FormatMismatch,
++	                   Status::DeviceMismatch, Status::PayloadCorrupted}) {
++		Check(std::strcmp(StatusName(status), "unknown") != 0, "every status has a name");
++	}
++}
++
++} // namespace
++
++int main() {
++	TestSignatureLayout();
++	TestRoundTrip();
++	TestLegacyLayoutCompatible();
++	TestTruncated();
++	TestCorruptPayload();
++	TestDriverUpdateInvalidates();
++	TestForeignFile();
++	TestStatusNames();
++	std::printf("DriverCacheFileTests: all tests passed\n");
++	return 0;
++}

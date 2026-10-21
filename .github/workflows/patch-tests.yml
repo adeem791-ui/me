@@ -1,0 +1,54 @@
+name: Patch stack and GPU-free tests
+
+# Fast check (a few minutes) that every patch still applies to the pinned
+# upstream commit and that the GPU-free Vulkan pipeline cache tests pass.
+# It does not build the emulator; the Windows workflow does that.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - 'patches/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+      - 'patches/**'
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Apply patches and run driver cache file tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch pinned upstream source
+        run: |
+          git clone --filter=blob:none https://github.com/KytyPS5/KytyPS5.git source
+          git -C source checkout 7b7f9a7
+          git -C source submodule update --init --depth 1 3rdparty/xxHash
+
+      - name: Apply patch stack in workflow order
+        run: |
+          for p in CollectScalarRead-stack-overflow.patch 02-large-compute-fast-compile.patch \
+                   03-vram-pressure-gc.patch 04-materialization-recovery.patch \
+                   05-shared-driver-cache.patch 06-driver-cache-file-tests.patch; do
+            git -C source apply --check "$GITHUB_WORKSPACE/patches/$p"
+            git -C source apply "$GITHUB_WORKSPACE/patches/$p"
+            echo "applied $p"
+          done
+
+      - name: Build and run driver cache file tests (GCC and Clang)
+        working-directory: source
+        run: |
+          for cxx in g++ clang++; do
+            $cxx -std=c++20 -O1 -Wall -Wextra -Werror -fsanitize=address,undefined \
+              -Isrc -I3rdparty/xxHash -DXXH_INLINE_ALL \
+              tests/DriverCacheFileTests.cpp -o driver_cache_file_tests_$cxx
+            ./driver_cache_file_tests_$cxx
+          done

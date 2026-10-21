@@ -23,4 +23,4 @@ The Windows workflow downloads [KytyPS5](https://github.com/KytyPS5/KytyPS5) at 
 ## Upstream and license
 Original emulator: [KytyPS5/KytyPS5](https://github.com/KytyPS5/KytyPS5).
 
-Upstream source is GPL-2.0 licensed; the distributed executable should retain the original license and provide access to corresponding source code and the modification. The patch is in `patches/CollectScalarRead-stack-overflow.patch`.
+Upstream source is GPL-2.0 licensed; the distributed executable should retain the original license and provide access to corresponding source code and the modification. The patches are in `patches/` and are applied in numeric order by the workflow. `patches/06-driver-cache-file-tests.patch` adds GPU-free tests for the Vulkan pipeline cache file and clearer cache-invalidation logging; see `docs/pipeline-cache-file-tests.md`.

@@ -80,6 +80,15 @@ jobs:
           git -C source apply $patch
           if ($LASTEXITCODE -ne 0) { throw "Shared cache patch application failed" }
 
+      - name: Apply pipeline cache file-format tests and invalidation logging
+        shell: pwsh
+        run: |
+          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/06-driver-cache-file-tests.patch'
+          git -C source apply --check $patch
+          if ($LASTEXITCODE -ne 0) { throw "Driver cache test patch validation failed" }
+          git -C source apply $patch
+          if ($LASTEXITCODE -ne 0) { throw "Driver cache test patch application failed" }
+
       - name: Locate vcpkg
         id: vcpkg
         shell: pwsh
@@ -118,12 +127,12 @@ jobs:
       - name: Compile launcher, emulator and shader tests
         shell: cmd
         run: |
-          cmake --build build --target launcher resource_tracking_tests scalar_provenance_tests --parallel 8
+          cmake --build build --target launcher resource_tracking_tests scalar_provenance_tests driver_cache_file_tests --parallel 8
 
       - name: Run shader regression tests
         shell: cmd
         run: |
-          ctest --test-dir build --output-on-failure -R "^(resource_tracking|scalar_provenance)$"
+          ctest --test-dir build --output-on-failure -R "^(resource_tracking|scalar_provenance|driver_cache_file)$"
 
       - name: Install portable app and assets
         shell: cmd
@@ -154,6 +163,7 @@ jobs:
           Copy-Item 'patches/03-vram-pressure-gc.patch' (Join-Path $dest '03-vram-pressure-gc.patch')
           Copy-Item 'patches/04-materialization-recovery.patch' (Join-Path $dest '04-materialization-recovery.patch')
           Copy-Item 'patches/05-shared-driver-cache.patch' (Join-Path $dest '05-shared-driver-cache.patch')
+          Copy-Item 'patches/06-driver-cache-file-tests.patch' (Join-Path $dest '06-driver-cache-file-tests.patch')
           Copy-Item 'scripts/START_SHARED_SHADER_CACHE.cmd' (Join-Path $dest 'START_SHARED_SHADER_CACHE.cmd')
           @'
           @echo off
