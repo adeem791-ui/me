@@ -3,7 +3,7 @@ name: Build portable KytyPS5 (Windows)
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, feature/yotei-compute-prewarm-v1]
     paths:
       - '.github/workflows/windows-portable.yml'
       - 'patches/**'
@@ -80,6 +80,15 @@ jobs:
           git -C source apply $patch
           if ($LASTEXITCODE -ne 0) { throw "Shared cache patch application failed" }
 
+      - name: Apply opt-in compute shader recording
+        shell: pwsh
+        run: |
+          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/06-record-known-compute-pipelines.patch'
+          git -C source apply --check $patch
+          if ($LASTEXITCODE -ne 0) { throw "Compute recorder patch validation failed" }
+          git -C source apply $patch
+          if ($LASTEXITCODE -ne 0) { throw "Compute recorder patch application failed" }
+
       - name: Locate vcpkg
         id: vcpkg
         shell: pwsh
@@ -130,6 +139,17 @@ jobs:
         run: |
           cmake --install build --prefix install
 
+      - name: Compile experimental compute prewarm tool
+        shell: cmd
+        run: |
+          clang-cl /nologo /std:c++20 /EHsc /O2 /MD ^
+            /Isource\\3rdparty\\Vulkan-Headers\\include ^
+            /Isource\\3rdparty\\xxHash ^
+            tools\\yotei\\kyty_compute_prewarm.cpp ^
+            /Fe:install\\kyty_compute_prewarm.exe
+          if errorlevel 1 exit /b 1
+          if not exist install\\kyty_compute_prewarm.exe exit /b 1
+
       - name: Bundle MSVC runtime and verify output
         shell: pwsh
         run: |
@@ -155,6 +175,10 @@ jobs:
           Copy-Item 'patches/04-materialization-recovery.patch' (Join-Path $dest '04-materialization-recovery.patch')
           Copy-Item 'patches/05-shared-driver-cache.patch' (Join-Path $dest '05-shared-driver-cache.patch')
           Copy-Item 'scripts/START_SHARED_SHADER_CACHE.cmd' (Join-Path $dest 'START_SHARED_SHADER_CACHE.cmd')
+          Copy-Item 'patches/06-record-known-compute-pipelines.patch' (Join-Path $dest '06-record-known-compute-pipelines.patch')
+          Copy-Item 'scripts/RECORD_COMPUTE_SHADERS.cmd' (Join-Path $dest 'RECORD_COMPUTE_SHADERS.cmd')
+          Copy-Item 'scripts/PRECOMPILE_KNOWN_COMPUTE.cmd' (Join-Path $dest 'PRECOMPILE_KNOWN_COMPUTE.cmd')
+          Copy-Item 'docs/yotei-compute-prewarm-prototype.md' (Join-Path $dest 'COMPUTE_PREWARM_README.md')
           @'
           @echo off
           cd /d "%~dp0"
@@ -175,12 +199,12 @@ jobs:
       - name: Archive portable Windows application
         shell: pwsh
         run: |
-          Compress-Archive -Path 'install/*' -DestinationPath "$env:RUNNER_TEMP/KytyPS5-Portable-Windows-StackFix.zip" -CompressionLevel Optimal
+          Compress-Archive -Path 'install/*' -DestinationPath "$env:RUNNER_TEMP/KytyPS5-Yotei-Compute-Prewarm-Experimental.zip" -CompressionLevel Optimal
 
       - name: Upload compiled Windows package
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Portable-Windows-StackFix
-          path: ${{ runner.temp }}/KytyPS5-Portable-Windows-StackFix.zip
+          name: KytyPS5-Yotei-Compute-Prewarm-Experimental
+          path: ${{ runner.temp }}/KytyPS5-Yotei-Compute-Prewarm-Experimental.zip
           if-no-files-found: error
           retention-days: 14
