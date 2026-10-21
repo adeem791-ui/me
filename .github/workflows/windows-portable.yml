@@ -53,6 +53,15 @@ jobs:
           git -C source apply $patch
           if ($LASTEXITCODE -ne 0) { throw "Compute patch application failed" }
 
+      - name: Apply VRAM-pressure texture-cache cleanup
+        shell: pwsh
+        run: |
+          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/03-vram-pressure-gc.patch'
+          git -C source apply --check $patch
+          if ($LASTEXITCODE -ne 0) { throw "VRAM-pressure patch validation failed" }
+          git -C source apply $patch
+          if ($LASTEXITCODE -ne 0) { throw "VRAM-pressure patch application failed" }
+
       - name: Locate vcpkg
         id: vcpkg
         shell: pwsh
@@ -124,6 +133,7 @@ jobs:
           Copy-Item 'source/LICENSE' (Join-Path $dest 'LICENSE_KytyPS5.txt')
           Copy-Item 'patches/CollectScalarRead-stack-overflow.patch' (Join-Path $dest 'CollectScalarRead-stack-overflow.patch')
           Copy-Item 'patches/02-large-compute-fast-compile.patch' (Join-Path $dest '02-large-compute-fast-compile.patch')
+          Copy-Item 'patches/03-vram-pressure-gc.patch' (Join-Path $dest '03-vram-pressure-gc.patch')
           @'
           @echo off
           cd /d "%~dp0"
