@@ -71,6 +71,15 @@ jobs:
           git -C source apply $patch
           if ($LASTEXITCODE -ne 0) { throw "Materialization patch application failed" }
 
+      - name: Enable optional shared Vulkan pipeline cache
+        shell: pwsh
+        run: |
+          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/05-shared-driver-cache.patch'
+          git -C source apply --check $patch
+          if ($LASTEXITCODE -ne 0) { throw "Shared cache patch validation failed" }
+          git -C source apply $patch
+          if ($LASTEXITCODE -ne 0) { throw "Shared cache patch application failed" }
+
       - name: Locate vcpkg
         id: vcpkg
         shell: pwsh
@@ -144,6 +153,8 @@ jobs:
           Copy-Item 'patches/02-large-compute-fast-compile.patch' (Join-Path $dest '02-large-compute-fast-compile.patch')
           Copy-Item 'patches/03-vram-pressure-gc.patch' (Join-Path $dest '03-vram-pressure-gc.patch')
           Copy-Item 'patches/04-materialization-recovery.patch' (Join-Path $dest '04-materialization-recovery.patch')
+          Copy-Item 'patches/05-shared-driver-cache.patch' (Join-Path $dest '05-shared-driver-cache.patch')
+          Copy-Item 'scripts/START_SHARED_SHADER_CACHE.cmd' (Join-Path $dest 'START_SHARED_SHADER_CACHE.cmd')
           @'
           @echo off
           cd /d "%~dp0"
