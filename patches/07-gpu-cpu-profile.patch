@@ -180,3 +180,4 @@
  
  		Common::LockGuard lock(gpu->m_queue_mutex);
  		if (!complete) {
+ 			submission.blocked = true;
