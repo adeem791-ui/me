@@ -114,9 +114,22 @@ struct VkApi {
             getInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(lib, "vkGetInstanceProcAddr"));
             if (!getInstanceProcAddr) return false;
         }
-#define LOAD_I(field, name) field = reinterpret_cast<decltype(field)>(getInstanceProcAddr(instance, "vk" #name)); if (!field) return false
-        LOAD_I(createInstance, CreateInstance);
-        if (instance == VK_NULL_HANDLE) return true;
+// Global Vulkan entry points must be resolved with a NULL instance.
+        // Do not resolve vkCreateInstance again after an instance is created:
+        // some Vulkan loaders correctly return NULL for that query.
+        if (instance == VK_NULL_HANDLE) {
+            createInstance = reinterpret_cast<PFN_vkCreateInstance>(
+                getInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance"));
+            if (!createInstance) {
+                std::cerr << "Missing global Vulkan procedure: vkCreateInstance\n";
+                return false;
+            }
+            return true;
+        }
+#define LOAD_I(field, name) do { \
+    field = reinterpret_cast<decltype(field)>(getInstanceProcAddr(instance, "vk" #name)); \
+    if (!field) { std::cerr << "Missing Vulkan instance procedure: vk" #name "\n"; return false; } \
+} while (false)
         LOAD_I(destroyInstance, DestroyInstance);
         LOAD_I(enumeratePhysicalDevices, EnumeratePhysicalDevices);
         LOAD_I(getPhysicalDeviceProperties, GetPhysicalDeviceProperties);
@@ -125,10 +138,16 @@ struct VkApi {
         LOAD_I(enumerateDeviceExtensions, EnumerateDeviceExtensionProperties);
         LOAD_I(createDevice, CreateDevice);
         getDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(getInstanceProcAddr(instance, "vkGetDeviceProcAddr"));
-        if (!getDeviceProcAddr) return false;
+        if (!getDeviceProcAddr) {
+            std::cerr << "Missing Vulkan instance procedure: vkGetDeviceProcAddr\n";
+            return false;
+        }
 #undef LOAD_I
         if (device == VK_NULL_HANDLE) return true;
-#define LOAD_D(field, name) field = reinterpret_cast<decltype(field)>(getDeviceProcAddr(device, "vk" #name)); if (!field) return false
+#define LOAD_D(field, name) do { \
+    field = reinterpret_cast<decltype(field)>(getDeviceProcAddr(device, "vk" #name)); \
+    if (!field) { std::cerr << "Missing Vulkan device procedure: vk" #name "\n"; return false; } \
+} while (false)
         LOAD_D(destroyDevice, DestroyDevice);
         LOAD_D(createCache, CreatePipelineCache);
         LOAD_D(destroyCache, DestroyPipelineCache);
@@ -256,7 +275,29 @@ WorkerStats CompileRange(VkApi& api, VkDevice device, VkPipelineCache cache,
     return stats;
 }
 
-// Sanity checks for the local recipe parser. No GPU or game files needed.
+// Minimal fake loader used by --selftest. It deliberately refuses to resolve
+// vkCreateInstance from a non-NULL instance, as valid Vulkan loaders may do.
+VKAPI_ATTR void VKAPI_CALL LoaderTestNoop() {}
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL LoaderTestGetProcAddr(VkInstance instance, const char* name) {
+    if (std::strcmp(name, "vkCreateInstance") == 0) {
+        return instance == VK_NULL_HANDLE
+            ? reinterpret_cast<PFN_vkVoidFunction>(&LoaderTestNoop) : nullptr;
+    }
+    if (instance == VK_NULL_HANDLE) return nullptr;
+    static constexpr const char* instance_names[] = {
+        "vkDestroyInstance", "vkEnumeratePhysicalDevices", "vkGetPhysicalDeviceProperties",
+        "vkGetPhysicalDeviceQueueFamilyProperties", "vkGetPhysicalDeviceFeatures2",
+        "vkEnumerateDeviceExtensionProperties", "vkCreateDevice", "vkGetDeviceProcAddr"
+    };
+    for (const auto* allowed : instance_names) {
+        if (std::strcmp(name, allowed) == 0) {
+            return reinterpret_cast<PFN_vkVoidFunction>(&LoaderTestNoop);
+        }
+    }
+    return nullptr;
+}
+
+// Sanity checks for the local recipe parser and Vulkan loader.
 int SelfTest() {
     const fs::path root = fs::temp_directory_path() /
         (L"KytyPrewarmSelfTest-" + std::to_wstring(GetCurrentProcessId()) + L".kcs");
@@ -280,6 +321,22 @@ int SelfTest() {
     }
     Recipe corrupt;
     success = success && !ReadRecipe(root, corrupt);
+
+    // Test the exact failure from the user's first prewarmer build.
+    // No physical Vulkan driver or GPU is needed.
+    VkApi loader_test;
+    loader_test.lib = reinterpret_cast<HMODULE>(static_cast<uintptr_t>(1));
+    loader_test.getInstanceProcAddr = &LoaderTestGetProcAddr;
+    const bool global_ok = loader_test.Init();
+    const auto create_instance_proc = loader_test.createInstance;
+    const bool instance_ok = global_ok && loader_test.Init(
+        reinterpret_cast<VkInstance>(static_cast<uintptr_t>(1)));
+    const bool loader_ok = instance_ok && create_instance_proc != nullptr &&
+                           loader_test.createInstance == create_instance_proc &&
+                           loader_test.destroyInstance != nullptr;
+    success = success && loader_ok;
+    std::cout << (loader_ok ? "Vulkan loader lookup self-test: PASS\n"
+                            : "Vulkan loader lookup self-test: FAIL\n");
     std::error_code ec;
     fs::remove(root, ec);
     std::cout << (success ? "KCS1 parser self-test: PASS\n" : "KCS1 parser self-test: FAIL\n");
