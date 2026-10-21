@@ -1,0 +1,182 @@
+--- a/src/graphics/guest_gpu/graphicsRun.cpp
++++ b/src/graphics/guest_gpu/graphicsRun.cpp
+@@ -23,8 +23,11 @@
+ 
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
+ #include <cstdio>
+ #include <deque>
+ #include <memory>
+ #include <mutex>
+@@ -445,19 +448,78 @@
+ 	KYTY_PROFILER_THREAD("Thread_Gpu");
+ 	g_gpu_thread = true;
+ 	g_gpu_state  = gpu;
+ 
++	// Optional single-thread queue diagnostics. Guest GPU PM4 commands cannot
++	// be safely spread over host threads just by setting CPU affinity. These
++	// counters measure whether the serialized processor is busy or waiting.
++	const char* profile_setting = std::getenv("KYTY_GPU_CPU_PROFILE");
++	const bool  profile = profile_setting != nullptr && std::strcmp(profile_setting, "1") == 0;
++	using ProfileClock = std::chrono::steady_clock;
++	auto          profile_start = ProfileClock::now();
++	uint64_t      busy_us = 0;
++	uint64_t      idle_wait_us = 0;
++	uint64_t      blocked_wait_us = 0;
++	uint64_t      graphics_us = 0;
++	uint64_t      compute_us = 0;
++	uint64_t      control_us = 0;
++	uint64_t      command_us = 0;
++	uint64_t      submissions = 0;
++	uint64_t      commands = 0;
++	uint64_t      incomplete_slices = 0;
++	uint64_t      blocked_poll_count = 0;
++	uint32_t      peak_queued_submissions = 0;
++	const auto profile_elapsed_us = [](ProfileClock::time_point start) -> uint64_t {
++		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
++		                                     ProfileClock::now() - start).count());
++	};
++	const auto profile_report = [&]() {
++		if (!profile) return;
++		const auto now = ProfileClock::now();
++		const auto window_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++		                           now - profile_start).count();
++		if (window_ms < 5000) return;
++		LOGF("GpuCpuProfile: interval_ms=%" PRId64 " busy_ms=%" PRIu64
++		     " graphics_ms=%" PRIu64 " compute_ms=%" PRIu64
++		     " control_ms=%" PRIu64 " command_ms=%" PRIu64
++		     " idle_wait_ms=%" PRIu64 " blocked_wait_ms=%" PRIu64
++		     " submissions=%" PRIu64 " commands=%" PRIu64
++		     " incomplete_slices=%" PRIu64 " blocked_polls=%" PRIu64
++		     " peak_queue=%u\n",
++		     static_cast<int64_t>(window_ms), busy_us / 1000, graphics_us / 1000,
++		     compute_us / 1000, control_us / 1000, command_us / 1000,
++		     idle_wait_us / 1000, blocked_wait_us / 1000,
++		     submissions, commands, incomplete_slices, blocked_poll_count,
++		     peak_queued_submissions);
++		profile_start = now;
++		busy_us = idle_wait_us = blocked_wait_us = 0;
++		graphics_us = compute_us = control_us = command_us = 0;
++		submissions = commands = incomplete_slices = blocked_poll_count = 0;
++		peak_queued_submissions = 0;
++	};
++	if (profile) {
++		LOGF("GpuCpuProfile: enabled host_logical_threads=%u serialized_pm4_workers=1 "
++		     "(counts are elapsed CPU-side queue times, not GPU execution times)\n",
++		     std::thread::hardware_concurrency());
++	}
++
+ 	for (;;) {
+ 		Submission                   submission;
+ 		Common::UniqueFunction<void> command;
+ 		bool                         has_submission = false;
+ 		bool                         should_stop    = false;
++		bool                         parked_blocked = false;
+ 		{
+ 			Common::LockGuard lock(gpu->m_queue_mutex);
+ 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+ 				gpu->m_processing = false;
+ 				gpu->m_idle.Signal();
++				const auto waited_since = profile ? ProfileClock::now() : ProfileClock::time_point {};
+ 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
++				if (profile) idle_wait_us += profile_elapsed_us(waited_since);
++			}
++			if (profile) {
++				peak_queued_submissions = std::max(peak_queued_submissions, gpu->m_submission_count);
+ 			}
+ 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+ 				gpu->m_processing = false;
+ 				gpu->m_idle.SignalAll();
+@@ -477,35 +539,56 @@
+ 					}
+ 				}
+ 				if (selected_queue < 0) {
+ 					gpu->m_processing = false;
++					// WaitFor takes microseconds, and Windows rounds this 100 us
++					// poll to 1 ms. It is NOT a 100 ms frame delay.
++					const auto waited_since = profile ? ProfileClock::now() : ProfileClock::time_point {};
+ 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
++					if (profile) {
++						blocked_wait_us += profile_elapsed_us(waited_since);
++						blocked_poll_count++;
++					}
+ 					for (auto& queue: gpu->m_queues) {
+ 						if (!queue.empty()) {
+ 							queue.front().blocked = false;
+ 						}
+ 					}
+-					continue;
++					parked_blocked = true;
++				} else {
++					auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
++					submission  = std::move(queue.front());
++					queue.pop_front();
++					gpu->m_submission_count--;
++					gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
++					gpu->m_processing = true;
++					has_submission    = true;
+ 				}
+-				auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
+-				submission  = std::move(queue.front());
+-				queue.pop_front();
+-				gpu->m_submission_count--;
+-				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
+-				gpu->m_processing = true;
+-				has_submission    = true;
+-			}
++			}
++		}
++		if (parked_blocked) {
++			profile_report();
++			continue;
+ 		}
+ 		if (should_stop) {
++			profile_report();
+ 			gpu->m_gfx_cp->BufferWait();
+ 			g_gpu_state  = nullptr;
+ 			g_gpu_thread = false;
+ 			return;
+ 		}
+ 
+ 		if (command) {
+ 			EXIT_IF(g_current_processor != nullptr);
++			const auto work_start = profile ? ProfileClock::now() : ProfileClock::time_point {};
+ 			command();
++			if (profile) {
++				const uint64_t us = profile_elapsed_us(work_start);
++				busy_us += us;
++				command_us += us;
++				commands++;
++			}
++			profile_report();
+ 
+ 			Common::LockGuard lock(gpu->m_queue_mutex);
+ 			gpu->m_processing = false;
+ 			if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+@@ -514,9 +597,23 @@
+ 			continue;
+ 		}
+ 
+ 		EXIT_IF(!has_submission);
++		const auto work_start = profile ? ProfileClock::now() : ProfileClock::time_point {};
+ 		const bool complete = gpu->Process(submission);
++		if (profile) {
++			const uint64_t us = profile_elapsed_us(work_start);
++			busy_us += us;
++			submissions++;
++			if (!complete) incomplete_slices++;
++			switch (submission.type) {
++				case SubmissionType::Graphics: graphics_us += us; break;
++				case SubmissionType::Compute: compute_us += us; break;
++				case SubmissionType::FlipPreparation:
++				case SubmissionType::SuspendPoint: control_us += us; break;
++			}
++		}
++		profile_report();
+ 
+ 		Common::LockGuard lock(gpu->m_queue_mutex);
+ 		if (!complete) {
