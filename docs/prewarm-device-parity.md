@@ -10,7 +10,11 @@ Robustness changes how out-of-bounds accesses are compiled. A driver may therefo
 ## What changed
 - `tools/prewarm_device_profile.h`: builds the prewarmer's device features and extensions from the emulator's `VulkanCreateDevice()` (upstream `vulkanWindow.cpp` at `7b7f9a7`). It covers the core feature list, the required 1.1/1.2/1.3 features, and the optional bits the emulator enables when supported: `shaderSharedInt64Atomics`, `robustImageAccess`, `subgroupSizeControl` (same wave64 rule), and `shaderFloat64` (same float-controls rule). It also enables `VK_EXT_robustness2`, `VK_KHR_workgroup_memory_explicit_layout`, `VK_EXT_shader_image_atomic_int64` and `VK_KHR_maintenance8` when present. It **never enables a feature or extension the GPU lacks.** Graphics-only state (swapchain, depth clip, color write, mesh, barycentrics, feedback loops, provoking vertex) is left out.
 - The prewarmer prints one line, `Device profile: robustBufferAccess=… robustBufferAccess2=… robustImageAccess=… robustImageAccess2=… nullDescriptor=… subgroupSizeControl=… extensions=…`. Compare it with the emulator's `Vulkan robustness:` and `Vulkan subgroup:` log lines.
-- `patches/08-compute-pipeline-cache-feedback.patch`: the emulator's `vkCreateComputePipelines done` log line now ends with `cache_hit=1|0|-1 driver_ms=N`, from Vulkan 1.3 `VkPipelineCreationFeedback`. It only reports; pipeline creation is unchanged. `-1` means the driver didn't report. Set `KYTY_PIPELINE_FEEDBACK=0` to turn it off.
+- `patches/08-compute-pipeline-cache-feedback.patch`: the emulator's `vkCreateComputePipelines done` log line now ends with `cache_hit=1|0|-1 driver_ms=N`, from Vulkan 1.3 `VkPipelineCreationFeedback`. It only reports; pipeline creation is unchanged.
+  - `cache_hit=1` is the useful signal: the driver says it skipped most of the compile thanks to the cache.
+  - `cache_hit=0` only means **no such hit was reported**. It doesn't prove nothing was reused; a driver may reuse part of the cache without setting the bit. Read it together with `elapsed_ms`.
+  - `-1` means the driver didn't report feedback.
+  - Set `KYTY_PIPELINE_FEEDBACK=0` to turn it off.
 
 **Same GPU:** the prewarmer picks the NVIDIA discrete GPU. If the emulator uses a different GPU or driver, the cache signature differs, and with #2 the emulator logs `invalidating … (GPU or driver changed)`.
 
@@ -29,7 +33,7 @@ Robustness changes how out-of-bounds accesses are compiled. A driver may therefo
 4. **C, emulator-warmed reference:** launch a second time with the cache the emulator saved itself.
 5. For each run, collect the `vkCreateComputePipelines done … shader=… elapsed_ms=… cache_hit=…` lines (no paths or game data). Compare by shader hash: hit rate, plus total and worst `elapsed_ms`.
 
-Expected if the hypothesis is right: A shows mostly `cache_hit=0`, while B and C show mostly `cache_hit=1` with much lower `elapsed_ms`. If A is already mostly hits, the hypothesis is wrong, and this change only removes a risk.
+Expected if the hypothesis is right: B and C show mostly `cache_hit=1` with much lower `elapsed_ms`, while A shows few hits and higher `elapsed_ms`. If A already shows mostly `cache_hit=1` and low times, the hypothesis is wrong, and this change only removes a risk. Base conclusions on `cache_hit=1` counts and `elapsed_ms`, not on `cache_hit=0` alone.
 
 ## Limits
 - A populated `VkPipelineCache` never guarantees hits. Drivers may also key on state not mirrored here.
