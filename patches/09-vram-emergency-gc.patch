@@ -1,0 +1,76 @@
+diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
+index b10ef88..984942f 100644
+--- a/src/graphics/guest_gpu/graphicsRun.cpp
++++ b/src/graphics/guest_gpu/graphicsRun.cpp
+@@ -646,19 +646,26 @@ bool GuestGpu::Process(Submission& submission) {
+ 
+ 	cp.BufferInit();
+ 	// Frame/suspend-point GC may never run if the guest stops presenting while
+-	// continuing to submit compute work. Check memory pressure periodically at
+-	// GPU submission boundaries, before allocations exhaust device-local VRAM.
+-	if (first_slice && submission.type != SubmissionType::SuspendPoint &&
+-	    (m_submit_id & 7u) == 0) {
++	// continuing to submit compute work. Check memory pressure at GPU submission
++	// boundaries, before allocations exhaust device-local VRAM. Every 8th submission
++	// normally; every submission once usage is at or over the budget, because the
++	// periodic check let usage pass the budget and reach ErrorOutOfDeviceMemory.
++	if (first_slice && submission.type != SubmissionType::SuspendPoint) {
+ 		auto& graphics = m_renderer.GetGraphics();
+ 		if (graphics.CanReportMemoryUsage()) {
+ 			constexpr uint64_t Headroom = 512ull * 1024 * 1024;
+ 			const auto budget = graphics.GetTotalMemoryBudget();
+ 			const auto usage = graphics.GetDeviceMemoryUsage();
+-			if (budget != 0 && usage >= (budget > Headroom ? budget - Headroom : budget)) {
+-				if ((m_submit_id & 63u) == 0) {
++			const bool near_budget =
++			    budget != 0 && usage >= (budget > Headroom ? budget - Headroom : budget);
++			const bool over_budget = budget != 0 && usage >= budget;
++			if (near_budget && (over_budget || (m_submit_id & 7u) == 0)) {
++				static uint32_t pressure_logs = 0;
++				if (pressure_logs < 16 || (m_submit_id & 255u) == 0) {
++					pressure_logs++;
+ 					LOGF("GPU memory pressure: usage=%" PRIu64 " budget=%" PRIu64
+-					     " - collecting idle caches\n", usage, budget);
++					     " over=%d submit=%" PRIu64 " - collecting idle caches\n",
++					     usage, budget, over_budget ? 1 : 0, m_submit_id);
+ 				}
+ 				m_renderer.RunGarbageCollector();
+ 			}
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+index 6eae1b1..ff9bc21 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+@@ -1909,7 +1909,9 @@ void TextureCache::RunGarbageCollector() {
+ 	// protected by the existing readback rules below.
+ 	const bool emergency = m_graphics.CanReportMemoryUsage() &&
+ 	                       m_total_used_memory >= m_graphics.GetTotalMemoryBudget();
+-	const auto collect = [&](bool allow_aggressive) {
++	size_t         freed_images = 0;
++	const uint64_t usage_before = m_total_used_memory;
++	const auto     collect       = [&](bool allow_aggressive) {
+ 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
+ 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
+ 		const uint64_t age = std::min<uint64_t>(
+@@ -1945,6 +1947,7 @@ void TextureCache::RunGarbageCollector() {
+ 				}
+ 			}
+ 			FreeImage(id);
++			++freed_images;
+ 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
+ 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
+ 				deletions >>= 2;
+@@ -1960,6 +1963,14 @@ void TextureCache::RunGarbageCollector() {
+ 	if (m_total_used_memory >= m_critical_gc_memory) {
+ 		collect(true);
+ 	}
++	// Emergency diagnostics: shows whether collection frees anything. Freed images are
++	// destroyed through the scheduler, so VMA usage can lag behind this count.
++	if (emergency && (tick % 16) == 0) {
++		LOGF("TextureCache emergency GC: tick=%" PRIu64 " freed_images=%zu usage_before=%" PRIu64
++		     " usage_after=%" PRIu64 "
++",
++		     tick, freed_images, usage_before, m_total_used_memory);
++	}
+ }
+ 
+ void TextureCache::ProcessDownloadImages() {
