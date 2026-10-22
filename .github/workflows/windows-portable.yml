@@ -10,11 +10,60 @@ on:
       - 'tools/**'
       - 'scripts/**'
       - 'README.md'
+  # PRs into the release branches (e.g. claude/* -> feature/yotei-compute-prewarm-v1) get the
+  # same build, so a PR head is tested before merge instead of only after.
+  pull_request:
+    branches: [main, feature/yotei-compute-prewarm-v1]
+    paths:
+      - '.github/workflows/windows-portable.yml'
+      - 'patches/**'
+      - 'tools/**'
+      - 'scripts/**'
+      - 'README.md'
 
 permissions:
   contents: read
 
+# A new push to the same PR cancels its older, still-running build.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # Fast GPU-free checks (a few minutes) so a broken patch stack shows up long before the
+  # Windows build finishes.
+  patch-check:
+    name: Patch stack applies and device-profile self-test (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out patch project
+        uses: actions/checkout@v4
+
+      - name: Retrieve pinned Kyty source and Vulkan headers
+        run: |
+          git clone --filter=blob:none https://github.com/KytyPS5/KytyPS5.git source
+          git -C source checkout 7b7f9a7
+          git -C source submodule update --init --depth 1 3rdparty/Vulkan-Headers
+
+      - name: Apply patch stack in build order
+        run: |
+          patches="CollectScalarRead-stack-overflow 02-large-compute-fast-compile 03-vram-pressure-gc"
+          patches="$patches 04-materialization-recovery 05-shared-driver-cache"
+          patches="$patches 06-record-known-compute-pipelines 07-gpu-cpu-profile"
+          patches="$patches 08-compute-pipeline-cache-feedback"
+          for p in $patches; do
+            git -C source apply --check "$GITHUB_WORKSPACE/patches/$p.patch" || { echo "::error::$p does not apply"; exit 1; }
+            git -C source apply "$GITHUB_WORKSPACE/patches/$p.patch"
+            echo "applied $p"
+          done
+
+      - name: Device-profile self-test
+        run: |
+          inc="-Isource/3rdparty/Vulkan-Headers/include -Itools"
+          g++ -std=c++17 -Wall -Wextra $inc tools/prewarm_device_profile_test.cpp -o device_profile_test
+          ./device_profile_test
+
   windows:
     name: Build, test and package Windows x64
     runs-on: windows-2022
