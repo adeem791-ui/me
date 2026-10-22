@@ -12,14 +12,18 @@
   | `GPU or driver changed` | vendor/device ID, driver version, or `pipelineCacheUUID` differs | Expected after a driver update; one slow run rebuilds it |
   | `payload checksum mismatch` | file truncated or corrupted (e.g. process killed mid-write on an old build) | Delete the `.bin` file |
   | `unknown file format` | not a Kyty cache file, or a different format version | Delete the `.bin` file |
-  | `file too small` / `file too large` | empty, truncated header, or > 4 GB | Delete the `.bin` file |
+  | `file too small` | empty file or truncated header | Delete the `.bin` file |
+  | `file larger than 1 GiB limit` | rejected before reading, so it can't exhaust RAM | Delete the `.bin` file |
+  | `cannot open …` / `read error on …` | file locked, permissions, or disk error (not a format problem) | Close other Kyty / prewarmer instances; check the folder |
 
 - Logs the cache size and read+verify time, e.g. `Vulkan pipeline cache: read and verified 101.50 MB in 85.3 ms`.
+- **Memory:** the file is size-checked before it is read, and the driver data is used in place (no second copy). `Save()` writes header and data separately, also without a copy.
+- **1 GiB limit (compatibility trade-off):** the old code accepted files up to 4 GB. Real caches are about 100 MB, and `kyty_compute_prewarm` already stops at 1 GiB. If a driver cache ever grows past 1 GiB it is not saved (logged), and the existing file is kept.
 - Logs when `KYTY_PIPELINE_CACHE_DIR` is set but ignored because it is not an absolute path (patch 05 ignored it silently).
 
 ## Tests
 `tests/DriverCacheFileTests.cpp` → CMake target `driver_cache_file_tests`, CTest name `driver_cache_file`. No GPU, Vulkan loader or game data needed. It checks:
-round trip (0 B – 1 MB payloads), legacy byte-layout compatibility, stable signature text, truncated header/payload, a flipped payload bit, driver-version / UUID / GPU changes, and foreign or old-format files.
+round trip (0 B – 1 MB payloads), zero-copy decode, header + payload writes equal to the whole-file layout, the size limit, legacy byte-layout compatibility, stable signature text, truncated header/payload, a flipped payload bit, driver-version / UUID / GPU changes, and foreign or old-format files.
 
 Run where it runs:
 - **Every PR touching `patches/` or workflows:** `.github/workflows/patch-tests.yml` (Linux, a few minutes) applies all six patches to `7b7f9a7` in workflow order, then builds the test with GCC and Clang (`-Wall -Wextra -Werror`, ASan + UBSan).

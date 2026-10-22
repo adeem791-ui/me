@@ -25,10 +25,10 @@ index 84c8ec83..2fcb4712 100644
  	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 diff --git a/src/graphics/host_gpu/renderer/pipeline/driverCacheFile.h b/src/graphics/host_gpu/renderer/pipeline/driverCacheFile.h
 new file mode 100644
-index 00000000..2c59b423
+index 00000000..b5e80206
 --- /dev/null
 +++ b/src/graphics/host_gpu/renderer/pipeline/driverCacheFile.h
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,126 @@
 +#ifndef GRAPHICS_HOST_GPU_RENDERER_PIPELINE_DRIVER_CACHE_FILE_H_
 +#define GRAPHICS_HOST_GPU_RENDERER_PIPELINE_DRIVER_CACHE_FILE_H_
 +
@@ -46,7 +46,6 @@ index 00000000..2c59b423
 +#include <cstdint>
 +#include <cstdio>
 +#include <cstring>
-+#include <limits>
 +#include <span>
 +#include <string>
 +#include <string_view>
@@ -55,6 +54,15 @@ index 00000000..2c59b423
 +namespace Libs::Graphics::DriverCacheFile {
 +
 +constexpr std::string_view SignatureTag = "KytyPC2:";
++
++// Files above this size are rejected before anything is allocated. Real caches are far smaller
++// (about 100 MB after a long Ghost of Yotei session), and kyty_compute_prewarm also stops at
++// 1 GiB. A driver cache larger than this is not saved, so the next launch starts empty.
++constexpr uint64_t MaxFileSize = uint64_t {1} << 30;
++
++inline bool FileSizeAllowed(uint64_t size) {
++	return size <= MaxFileSize;
++}
 +
 +struct DeviceIdentity {
 +	uint32_t                 vendor_id      = 0;
@@ -76,7 +84,7 @@ index 00000000..2c59b423
 +	switch (status) {
 +		case Status::Valid: return "valid";
 +		case Status::TooSmall: return "file too small";
-+		case Status::TooLarge: return "file too large";
++		case Status::TooLarge: return "file larger than 1 GiB limit";
 +		case Status::FormatMismatch: return "unknown file format";
 +		case Status::DeviceMismatch: return "GPU or driver changed";
 +		case Status::PayloadCorrupted: return "payload checksum mismatch";
@@ -98,23 +106,30 @@ index 00000000..2c59b423
 +	return std::string(SignatureTag) + ids + uuid + "\n";
 +}
 +
-+inline std::vector<uint8_t> Encode(std::string_view signature, std::span<const uint8_t> payload) {
++// Bytes that go before the payload. Written separately so the payload is never copied.
++inline std::vector<uint8_t> EncodeHeader(std::string_view signature,
++                                         std::span<const uint8_t> payload) {
 +	const uint64_t       hash = XXH3_64bits(payload.data(), payload.size());
-+	std::vector<uint8_t> file(signature.size() + sizeof(hash) + payload.size());
-+	std::memcpy(file.data(), signature.data(), signature.size());
-+	std::memcpy(file.data() + signature.size(), &hash, sizeof(hash));
-+	if (!payload.empty()) {
-+		std::memcpy(file.data() + signature.size() + sizeof(hash), payload.data(), payload.size());
-+	}
++	std::vector<uint8_t> header(signature.size() + sizeof(hash));
++	std::memcpy(header.data(), signature.data(), signature.size());
++	std::memcpy(header.data() + signature.size(), &hash, sizeof(hash));
++	return header;
++}
++
++// Whole file in one buffer; used by tests.
++inline std::vector<uint8_t> Encode(std::string_view signature, std::span<const uint8_t> payload) {
++	auto file = EncodeHeader(signature, payload);
++	file.insert(file.end(), payload.begin(), payload.end());
 +	return file;
 +}
 +
-+// Parses a whole cache file. On Valid, `payload` holds the driver data; otherwise it is cleared.
++// Parses a whole cache file. On Valid, `payload` points into `file` (no copy); otherwise it is
++// empty.
 +inline Status Decode(std::string_view expected_signature, std::span<const uint8_t> file,
-+                     std::vector<uint8_t>* payload) {
-+	payload->clear();
++                     std::span<const uint8_t>* payload) {
++	*payload = {};
 +	const size_t header_size = expected_signature.size() + sizeof(uint64_t);
-+	if (file.size() > std::numeric_limits<uint32_t>::max()) {
++	if (!FileSizeAllowed(file.size())) {
 +		return Status::TooLarge;
 +	}
 +	if (file.size() < header_size) {
@@ -133,7 +148,7 @@ index 00000000..2c59b423
 +	if (XXH3_64bits(data.data(), data.size()) != stored_hash) {
 +		return Status::PayloadCorrupted;
 +	}
-+	payload->assign(data.begin(), data.end());
++	*payload = data;
 +	return Status::Valid;
 +}
 +
@@ -141,7 +156,7 @@ index 00000000..2c59b423
 +
 +#endif // GRAPHICS_HOST_GPU_RENDERER_PIPELINE_DRIVER_CACHE_FILE_H_
 diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
-index fe81f3e2..5d345c53 100644
+index fe81f3e2..ddb0dfb6 100644
 --- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
 +++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
 @@ -20,6 +20,8 @@
@@ -186,11 +201,20 @@ index fe81f3e2..5d345c53 100644
  		}
  	}
  	const auto path         = Common::PathToString(m_driver_cache_path);
-@@ -589,34 +593,33 @@ void PipelineCache::InitializeDriverCache() {
+@@ -587,36 +591,50 @@ void PipelineCache::InitializeDriverCache() {
+ 	} else {
+ 		PipelineCacheLog("Vulkan pipeline cache: initializing {}", path);
  	}
- 	std::vector<uint8_t> initial_data;
+-	std::vector<uint8_t> initial_data;
++	std::vector<uint8_t>     file_data;
++	std::span<const uint8_t> initial_data;
  	if (cache_exists) {
 +		const auto load_begin = std::chrono::steady_clock::now();
++		const auto elapsed_ms = [&] {
++			return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
++			                                                 load_begin)
++			    .count();
++		};
  		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
 -		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
 -		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
@@ -207,7 +231,12 @@ index fe81f3e2..5d345c53 100644
 -			file.Read(&payload_hash, sizeof(payload_hash), &hash_read);
 -			file.Read(initial_data.data(), static_cast<uint32_t>(initial_data.size()),
 -			          &payload_read);
--			file.Close();
++		if (file.IsInvalid()) {
++			PipelineCacheLog("Vulkan pipeline cache: cannot open {}; starting empty", path);
++		} else if (const uint64_t file_size = file.Size();
++		           !DriverCacheFile::FileSizeAllowed(file_size)) {
++			// Checked before allocating, so an oversized file cannot exhaust RAM at startup.
+ 			file.Close();
 -			if (signature_read != cached_signature.size() || hash_read != sizeof(payload_hash) ||
 -			    payload_read != initial_data.size() || cached_signature != signature ||
 -			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
@@ -216,80 +245,100 @@ index fe81f3e2..5d345c53 100644
 -				    "Vulkan pipeline cache: invalidating {} (driver or data mismatch)",
 -				    path);
 -			}
-+		const uint64_t file_size = file.IsInvalid() ? 0 : file.Size();
-+		std::vector<uint8_t> file_data;
-+		uint32_t             file_read = 0;
-+		if (file_size <= std::numeric_limits<uint32_t>::max()) {
-+			file_data.resize(file_size);
-+			file.Read(file_data.data(), static_cast<uint32_t>(file_data.size()), &file_read);
-+		}
-+		file.Close();
-+		auto status = DriverCacheFile::Status::TooLarge;
-+		if (file_size <= std::numeric_limits<uint32_t>::max()) {
-+			file_data.resize(file_read);
-+			status = DriverCacheFile::Decode(
-+			    DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties()), file_data,
-+			    &initial_data);
-+		}
-+		const auto load_ms = std::chrono::duration<double, std::milli>(
-+		                         std::chrono::steady_clock::now() - load_begin)
-+		                         .count();
-+		if (status != DriverCacheFile::Status::Valid) {
-+			PipelineCacheLog("Vulkan pipeline cache: invalidating {} ({}, {:.2f} MB, {:.1f} ms)",
-+			                 path, DriverCacheFile::StatusName(status),
-+			                 static_cast<double>(file_size) / 1'000'000.0, load_ms);
++			PipelineCacheLog("Vulkan pipeline cache: invalidating {} ({}, {:.2f} MB)", path,
++			                 DriverCacheFile::StatusName(DriverCacheFile::Status::TooLarge),
++			                 static_cast<double>(file_size) / 1'000'000.0);
  		} else {
--			file.Close();
++			file_data.resize(file_size);
++			uint32_t file_read = 0;
++			file.Read(file_data.data(), static_cast<uint32_t>(file_data.size()), &file_read);
+ 			file.Close();
 -			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size)", path);
-+			PipelineCacheLog("Vulkan pipeline cache: read and verified {:.2f} MB in {:.1f} ms",
-+			                 static_cast<double>(file_size) / 1'000'000.0, load_ms);
++			if (file_read != file_size) {
++				PipelineCacheLog(
++				    "Vulkan pipeline cache: read error on {} ({} of {} bytes); starting empty",
++				    path, file_read, file_size);
++				file_data.clear();
++			} else {
++				const auto status = DriverCacheFile::Decode(
++				    DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties()), file_data,
++				    &initial_data);
++				if (status != DriverCacheFile::Status::Valid) {
++					PipelineCacheLog(
++					    "Vulkan pipeline cache: invalidating {} ({}, {:.2f} MB, {:.1f} ms)", path,
++					    DriverCacheFile::StatusName(status),
++					    static_cast<double>(file_size) / 1'000'000.0, elapsed_ms());
++					file_data.clear();
++				} else {
++					PipelineCacheLog("Vulkan pipeline cache: read and verified {:.2f} MB in {:.1f} ms",
++					                 static_cast<double>(file_size) / 1'000'000.0, elapsed_ms());
++				}
++			}
  		}
  	}
  
-@@ -684,9 +687,8 @@ void PipelineCache::Save() {
+@@ -627,7 +645,8 @@ void PipelineCache::InitializeDriverCache() {
+ 	if (result != vk::Result::eSuccess && !initial_data.empty()) {
+ 		PipelineCacheLog("Vulkan pipeline cache: driver rejected {} ({}); starting empty", path,
+ 		                 vk::to_string(result));
+-		initial_data.clear();
++		initial_data = {};
++		file_data.clear();
+ 		create.initialDataSize = 0;
+ 		create.pInitialData    = nullptr;
+ 		result = m_graphics.device.createPipelineCache(&create, nullptr, &m_driver_cache);
+@@ -684,9 +703,14 @@ void PipelineCache::Save() {
  		return;
  	}
  	payload.resize(size);
 -	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 -	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
 -	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
-+	const auto encoded = DriverCacheFile::Encode(
++	const auto header = DriverCacheFile::EncodeHeader(
 +	    DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties()), payload);
++	if (!DriverCacheFile::FileSizeAllowed(header.size() + payload.size())) {
++		// The loader would reject this file, so keep the existing one instead.
++		PipelineCacheLog("Vulkan pipeline cache: not saved ({:.2f} MB exceeds the 1 GiB limit)",
++		                 static_cast<double>(payload.size()) / 1'000'000.0);
++		return;
++	}
  	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
  		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
  		return;
-@@ -694,15 +696,13 @@ void PipelineCache::Save() {
+@@ -694,15 +718,16 @@ void PipelineCache::Save() {
  	auto temp_path = m_driver_cache_path;
  	temp_path += ".tmp";
  	Common::File file;
 -	uint32_t     prefix_written  = 0;
--	uint32_t     payload_written = 0;
--	if (file.Create(temp_path)) {
++	uint32_t     header_written  = 0;
+ 	uint32_t     payload_written = 0;
+ 	if (file.Create(temp_path)) {
 -		file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
--		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
-+	uint32_t     written_size = 0;
-+	if (encoded.size() <= std::numeric_limits<uint32_t>::max() && file.Create(temp_path)) {
-+		file.Write(encoded.data(), static_cast<uint32_t>(encoded.size()), &written_size);
++		file.Write(header.data(), static_cast<uint32_t>(header.size()), &header_written);
+ 		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
  	}
  	const bool flushed = !file.IsInvalid() && file.Flush();
  	file.Close();
 -	const bool written = prefix_written == prefix.size() && payload_written == payload.size() && flushed;
-+	const bool written = written_size == encoded.size() && flushed;
++	const bool written =
++	    header_written == header.size() && payload_written == payload.size() && flushed;
  	std::error_code error;
  	if (written) {
  		std::filesystem::rename(temp_path, m_driver_cache_path, error);
 diff --git a/tests/DriverCacheFileTests.cpp b/tests/DriverCacheFileTests.cpp
 new file mode 100644
-index 00000000..edf6fbc3
+index 00000000..80abec0c
 --- /dev/null
 +++ b/tests/DriverCacheFileTests.cpp
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,170 @@
 +#include "graphics/host_gpu/renderer/pipeline/driverCacheFile.h"
 +
++#include <algorithm>
 +#include <cstdint>
 +#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
++#include <span>
 +#include <string>
 +#include <vector>
 +
@@ -337,9 +386,13 @@ index 00000000..edf6fbc3
 +		const auto file    = Encode(signature, payload);
 +		Check(file.size() == signature.size() + sizeof(uint64_t) + payload.size(),
 +		      "encoded size is signature + hash + payload");
-+		std::vector<uint8_t> decoded {1, 2, 3};
++		std::span<const uint8_t> decoded;
 +		Check(Decode(signature, file, &decoded) == Status::Valid, "round trip is valid");
-+		Check(decoded == payload, "round trip preserves payload");
++		Check(std::equal(decoded.begin(), decoded.end(), payload.begin(), payload.end()),
++		      "round trip preserves payload");
++		// The payload is a view into the file buffer, so loading does not double memory use.
++		Check(decoded.data() == file.data() + signature.size() + sizeof(uint64_t),
++		      "decoded payload is not a view into the file");
 +	}
 +}
 +
@@ -359,11 +412,12 @@ index 00000000..edf6fbc3
 +void TestTruncated() {
 +	const auto signature = Signature(TestDevice());
 +	const auto file      = Encode(signature, TestPayload(64));
-+	std::vector<uint8_t> decoded;
++	std::span<const uint8_t> decoded;
 +	Check(Decode(signature, std::span(file).first(0), &decoded) == Status::TooSmall, "empty file");
 +	Check(Decode(signature, std::span(file).first(signature.size() + 3), &decoded) == Status::TooSmall,
 +	      "truncated header");
 +	// Truncated payload keeps a valid header, so the checksum catches it.
++	decoded = file;
 +	Check(Decode(signature, std::span(file).first(file.size() - 1), &decoded) ==
 +	          Status::PayloadCorrupted,
 +	      "truncated payload");
@@ -374,7 +428,7 @@ index 00000000..edf6fbc3
 +	const auto signature = Signature(TestDevice());
 +	auto       file      = Encode(signature, TestPayload(256));
 +	file[file.size() / 2 + signature.size()] ^= 0x40u;
-+	std::vector<uint8_t> decoded;
++	std::span<const uint8_t> decoded = file;
 +	Check(Decode(signature, file, &decoded) == Status::PayloadCorrupted, "flipped payload bit");
 +	Check(decoded.empty(), "corrupt payload is not returned");
 +}
@@ -382,7 +436,7 @@ index 00000000..edf6fbc3
 +void TestDriverUpdateInvalidates() {
 +	auto       old_device = TestDevice();
 +	const auto file       = Encode(Signature(old_device), TestPayload(128));
-+	std::vector<uint8_t> decoded;
++	std::span<const uint8_t> decoded;
 +
 +	auto driver_update = old_device;
 +	driver_update.driver_version++;
@@ -403,10 +457,25 @@ index 00000000..edf6fbc3
 +	const auto signature = Signature(TestDevice());
 +	std::vector<uint8_t> file(signature.size() + 64, 0);
 +	std::memcpy(file.data(), "KytyPC1:", 8);
-+	std::vector<uint8_t> decoded;
++	std::span<const uint8_t> decoded;
 +	Check(Decode(signature, file, &decoded) == Status::FormatMismatch, "older format tag");
 +	std::memset(file.data(), 'x', signature.size());
 +	Check(Decode(signature, file, &decoded) == Status::FormatMismatch, "random file");
++}
++
++void TestHeaderPlusPayloadMatchesEncode() {
++	const auto signature = Signature(TestDevice());
++	const auto payload   = TestPayload(777);
++	auto       pieces    = EncodeHeader(signature, payload);
++	pieces.insert(pieces.end(), payload.begin(), payload.end());
++	Check(pieces == Encode(signature, payload), "Save() writes header then payload, same bytes");
++}
++
++void TestSizeLimit() {
++	Check(FileSizeAllowed(0) && FileSizeAllowed(MaxFileSize), "sizes up to the limit are allowed");
++	Check(!FileSizeAllowed(MaxFileSize + 1), "size above the limit is rejected");
++	Check(!FileSizeAllowed(UINT64_MAX), "huge size is rejected");
++	Check(MaxFileSize >= 512u * 1024 * 1024, "limit still fits caches written by the prewarmer");
 +}
 +
 +void TestStatusNames() {
@@ -426,6 +495,8 @@ index 00000000..edf6fbc3
 +	TestCorruptPayload();
 +	TestDriverUpdateInvalidates();
 +	TestForeignFile();
++	TestHeaderPlusPayloadMatchesEncode();
++	TestSizeLimit();
 +	TestStatusNames();
 +	std::printf("DriverCacheFileTests: all tests passed\n");
 +	return 0;
