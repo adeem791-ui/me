@@ -14,6 +14,7 @@ if not exist "%~dp0SAMPLE_EMULATOR_PERFORMANCE.ps1" (
 )
 if exist "%~dp0START_SHARED_SHADER_CACHE.cmd" (
   call "%~dp0START_SHARED_SHADER_CACHE.cmd"
+  if errorlevel 1 exit /b 1
 ) else (
   start "" /D "%~dp0" "%~dp0kyty_launcher.exe"
 )
