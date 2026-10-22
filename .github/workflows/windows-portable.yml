@@ -155,6 +155,8 @@ jobs:
           Copy-Item 'patches/04-materialization-recovery.patch' (Join-Path $dest '04-materialization-recovery.patch')
           Copy-Item 'patches/05-shared-driver-cache.patch' (Join-Path $dest '05-shared-driver-cache.patch')
           Copy-Item 'scripts/START_SHARED_SHADER_CACHE.cmd' (Join-Path $dest 'START_SHARED_SHADER_CACHE.cmd')
+          Copy-Item 'scripts/SAMPLE_EMULATOR_PERFORMANCE.ps1' (Join-Path $dest 'SAMPLE_EMULATOR_PERFORMANCE.ps1')
+          Copy-Item 'scripts/START_WITH_TELEMETRY.cmd' (Join-Path $dest 'START_WITH_TELEMETRY.cmd')
           @'
           @echo off
           cd /d "%~dp0"
