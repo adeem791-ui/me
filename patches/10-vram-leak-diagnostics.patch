@@ -1,0 +1,167 @@
+diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
+index 984942f..78ce213 100644
+--- a/src/graphics/guest_gpu/graphicsRun.cpp
++++ b/src/graphics/guest_gpu/graphicsRun.cpp
+@@ -671,6 +671,15 @@ bool GuestGpu::Process(Submission& submission) {
+ 			}
+ 		}
+ 	}
++	// Memory breakdown for leak hunting: a few counters, logged every 5 seconds.
++	if (first_slice) {
++		static std::chrono::steady_clock::time_point last_stats {};
++		const auto                                   now = std::chrono::steady_clock::now();
++		if (now - last_stats >= std::chrono::seconds(5)) {
++			last_stats = now;
++			m_renderer.LogMemoryStats();
++		}
++	}
+ 	bool complete = true;
+ 
+ 	switch (submission.type) {
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+index d452db9..01ce176 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+@@ -274,6 +274,17 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
+ 	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
+ }
+ 
++void BufferCache::LogMemoryStats() {
++	size_t             buffers = 0;
++	unsigned long long bytes   = 0;
++	m_slot_buffers.ForEach([&](BufferId, const Buffer& buffer) {
++		++buffers;
++		bytes += buffer.Size();
++	});
++	LOGF("BufferCache stats: buffers=%zu bytes=%llu
++", buffers, bytes);
++}
++
+ BufferCache::~BufferCache() {
+ 	if (!m_gpu_modified_ranges.Empty()) {
+ 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.h b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+index 27bf987..e6cf082 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.h
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+@@ -85,6 +85,7 @@ public:
+ 		m_memory_tracker.QueueBdaSync(vaddr, size);
+ 	}
+ 	void               RunGarbageCollector();
++	void LogMemoryStats();
+ 
+ private:
+ 	friend struct BufferCacheTestAccess;
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+index ff9bc21..dc3f964 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+@@ -1973,6 +1973,34 @@ void TextureCache::RunGarbageCollector() {
+ 	}
+ }
+ 
++void TextureCache::LogMemoryStats() {
++	std::scoped_lock lock {m_lock};
++	size_t           images    = 0;
++	size_t           modified  = 0;
++	uint64_t         accounted = 0;
++	std::vector<std::pair<uint64_t, uint32_t>> surfaces;
++	m_slot_images.ForEach([&](ImageId, const Image& image) {
++		if (!image.registered) {
++			return;
++		}
++		++images;
++		accounted += image.AccountedSize();
++		if (image.IsGpuModified()) {
++			++modified;
++		}
++		surfaces.emplace_back(image.info.data.address,
++		                      static_cast<uint32_t>(image.info.pixel_format));
++	});
++	std::sort(surfaces.begin(), surfaces.end());
++	const auto distinct =
++	    static_cast<size_t>(std::unique(surfaces.begin(), surfaces.end()) - surfaces.begin());
++	// Images that share a guest address and format are duplicates of one surface.
++	LOGF("TextureCache stats: images=%zu accounted=%" PRIu64 " gpu_modified=%zu "
++	     "same_surface_duplicates=%zu
++",
++	     images, accounted, modified, images - distinct);
++}
++
+ void TextureCache::ProcessDownloadImages() {
+ 	if (!m_readback_linear_images) {
+ 		return;
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.h b/src/graphics/host_gpu/renderer/cache/textureCache.h
+index ebf3b6b..762474f 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.h
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.h
+@@ -78,6 +78,7 @@ public:
+ 	void UnmapMemory(uint64_t address, uint64_t size);
+ 	void ProcessDownloadImages();
+ 	void RunGarbageCollector();
++	void LogMemoryStats();
+ 
+ private:
+ 	struct MetaDataInfo {
+diff --git a/src/graphics/host_gpu/renderer/commandScheduler.cpp b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+index afab551..42de328 100644
+--- a/src/graphics/host_gpu/renderer/commandScheduler.cpp
++++ b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+@@ -260,6 +260,11 @@ bool CommandScheduler::HasPendingPriorityOperations() {
+ 	return !m_priority_operations.empty() || m_priority_active;
+ }
+ 
++size_t CommandScheduler::PendingOperationCount() {
++	std::lock_guard lock(m_operation_mutex);
++	return m_pending_operations.size() + m_priority_operations.size();
++}
++
+ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+ 	while (!stop.stop_requested()) {
+ 		PendingOperation operation;
+diff --git a/src/graphics/host_gpu/renderer/commandScheduler.h b/src/graphics/host_gpu/renderer/commandScheduler.h
+index 6e41885..0abc99e 100644
+--- a/src/graphics/host_gpu/renderer/commandScheduler.h
++++ b/src/graphics/host_gpu/renderer/commandScheduler.h
+@@ -41,6 +41,7 @@ public:
+ 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
+ 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+ 	[[nodiscard]] bool        HasPendingPriorityOperations();
++	[[nodiscard]] size_t        PendingOperationCount();
+ 	[[nodiscard]] static bool InDeferredOperation() noexcept;
+ 
+ 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
+diff --git a/src/graphics/host_gpu/renderer/renderContext.cpp b/src/graphics/host_gpu/renderer/renderContext.cpp
+index e256b8a..bdca65d 100644
+--- a/src/graphics/host_gpu/renderer/renderContext.cpp
++++ b/src/graphics/host_gpu/renderer/renderContext.cpp
+@@ -134,6 +134,17 @@ void RenderContext::PrepareBda() {
+ 	m_fault_process_pending = true;
+ }
+ 
++void RenderContext::LogMemoryStats() {
++	m_texture_cache.LogMemoryStats();
++	m_buffer_cache.LogMemoryStats();
++	LOGF("Scheduler stats: pending_operations=%zu
++", m_command_scheduler.PendingOperationCount());
++	LOGF("Device memory stats: usage=%llu budget=%llu
++",
++	     static_cast<unsigned long long>(GetGraphics().GetDeviceMemoryUsage()),
++	     static_cast<unsigned long long>(GetGraphics().GetTotalMemoryBudget()));
++}
++
+ void RenderContext::RunGarbageCollector() {
+ 	if (m_fault_process_pending) {
+ 		m_fault_process_pending = false;
+diff --git a/src/graphics/host_gpu/renderer/renderContext.h b/src/graphics/host_gpu/renderer/renderContext.h
+index e264213..1e86f4d 100644
+--- a/src/graphics/host_gpu/renderer/renderContext.h
++++ b/src/graphics/host_gpu/renderer/renderContext.h
+@@ -55,6 +55,7 @@ public:
+ 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+ 	void               PrepareBda();
+ 	void               RunGarbageCollector();
++	void LogMemoryStats();
+ 
+ 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
+ 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
