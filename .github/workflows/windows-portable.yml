@@ -100,6 +100,15 @@ jobs:
           git -C source apply $patch
           if ($LASTEXITCODE -ne 0) { throw "GPU CPU profiler patch application failed" }
 
+      - name: Apply compute pipeline cache-hit feedback logging
+        shell: pwsh
+        run: |
+          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/08-compute-pipeline-cache-feedback.patch'
+          git -C source apply --check $patch
+          if ($LASTEXITCODE -ne 0) { throw "Cache feedback patch validation failed" }
+          git -C source apply $patch
+          if ($LASTEXITCODE -ne 0) { throw "Cache feedback patch application failed" }
+
       - name: Locate vcpkg
         id: vcpkg
         shell: pwsh
@@ -192,6 +201,7 @@ jobs:
           Copy-Item 'scripts/RECORD_COMPUTE_SHADERS.cmd' (Join-Path $dest 'RECORD_COMPUTE_SHADERS.cmd')
           Copy-Item 'scripts/PRECOMPILE_KNOWN_COMPUTE.cmd' (Join-Path $dest 'PRECOMPILE_KNOWN_COMPUTE.cmd')
           Copy-Item 'patches/07-gpu-cpu-profile.patch' (Join-Path $dest '07-gpu-cpu-profile.patch')
+          Copy-Item 'patches/08-compute-pipeline-cache-feedback.patch' (Join-Path $dest '08-compute-pipeline-cache-feedback.patch')
           Copy-Item 'scripts/START_GPU_CPU_PROFILE.cmd' (Join-Path $dest 'START_GPU_CPU_PROFILE.cmd')
           Copy-Item 'scripts/PROFILE_CPU_THREADS.cmd' (Join-Path $dest 'PROFILE_CPU_THREADS.cmd')
           Copy-Item 'scripts/PROFILE_CPU_THREADS.ps1' (Join-Path $dest 'PROFILE_CPU_THREADS.ps1')
