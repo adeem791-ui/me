@@ -37,7 +37,7 @@ index b10ef88..984942f 100644
  				m_renderer.RunGarbageCollector();
  			}
 diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
-index 6eae1b1..ff9bc21 100644
+index 6eae1b1..b6dc8d8 100644
 --- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
 +++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
 @@ -1909,7 +1909,9 @@ void TextureCache::RunGarbageCollector() {
@@ -59,7 +59,7 @@ index 6eae1b1..ff9bc21 100644
  			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
  			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
  				deletions >>= 2;
-@@ -1960,6 +1963,14 @@ void TextureCache::RunGarbageCollector() {
+@@ -1960,6 +1963,13 @@ void TextureCache::RunGarbageCollector() {
  	if (m_total_used_memory >= m_critical_gc_memory) {
  		collect(true);
  	}
@@ -67,8 +67,7 @@ index 6eae1b1..ff9bc21 100644
 +	// destroyed through the scheduler, so VMA usage can lag behind this count.
 +	if (emergency && (tick % 16) == 0) {
 +		LOGF("TextureCache emergency GC: tick=%" PRIu64 " freed_images=%zu usage_before=%" PRIu64
-+		     " usage_after=%" PRIu64 "
-+",
++		     " usage_after=%" PRIu64 "\n",
 +		     tick, freed_images, usage_before, m_total_used_memory);
 +	}
  }

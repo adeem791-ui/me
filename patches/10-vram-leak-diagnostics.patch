@@ -19,10 +19,10 @@ index 984942f..78ce213 100644
  
  	switch (submission.type) {
 diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
-index d452db9..01ce176 100644
+index d452db9..0ba4df0 100644
 --- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
 +++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
-@@ -274,6 +274,17 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
+@@ -274,6 +274,16 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
  	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
  }
  
@@ -33,8 +33,7 @@ index d452db9..01ce176 100644
 +		++buffers;
 +		bytes += buffer.Size();
 +	});
-+	LOGF("BufferCache stats: buffers=%zu bytes=%llu
-+", buffers, bytes);
++	LOGF("BufferCache stats: buffers=%zu bytes=%llu\n", buffers, bytes);
 +}
 +
  BufferCache::~BufferCache() {
@@ -53,10 +52,10 @@ index 27bf987..e6cf082 100644
  private:
  	friend struct BufferCacheTestAccess;
 diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
-index ff9bc21..dc3f964 100644
+index b6dc8d8..5ee097a 100644
 --- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
 +++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
-@@ -1973,6 +1973,34 @@ void TextureCache::RunGarbageCollector() {
+@@ -1972,6 +1972,33 @@ void TextureCache::RunGarbageCollector() {
  	}
  }
  
@@ -83,8 +82,7 @@ index ff9bc21..dc3f964 100644
 +	    static_cast<size_t>(std::unique(surfaces.begin(), surfaces.end()) - surfaces.begin());
 +	// Images that share a guest address and format are duplicates of one surface.
 +	LOGF("TextureCache stats: images=%zu accounted=%" PRIu64 " gpu_modified=%zu "
-+	     "same_surface_duplicates=%zu
-+",
++	     "same_surface_duplicates=%zu\n",
 +	     images, accounted, modified, images - distinct);
 +}
 +
@@ -132,20 +130,18 @@ index 6e41885..0abc99e 100644
  
  	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 diff --git a/src/graphics/host_gpu/renderer/renderContext.cpp b/src/graphics/host_gpu/renderer/renderContext.cpp
-index e256b8a..bdca65d 100644
+index e256b8a..8f3dddd 100644
 --- a/src/graphics/host_gpu/renderer/renderContext.cpp
 +++ b/src/graphics/host_gpu/renderer/renderContext.cpp
-@@ -134,6 +134,17 @@ void RenderContext::PrepareBda() {
+@@ -134,6 +134,15 @@ void RenderContext::PrepareBda() {
  	m_fault_process_pending = true;
  }
  
 +void RenderContext::LogMemoryStats() {
 +	m_texture_cache.LogMemoryStats();
 +	m_buffer_cache.LogMemoryStats();
-+	LOGF("Scheduler stats: pending_operations=%zu
-+", m_command_scheduler.PendingOperationCount());
-+	LOGF("Device memory stats: usage=%llu budget=%llu
-+",
++	LOGF("Scheduler stats: pending_operations=%zu\n", m_command_scheduler.PendingOperationCount());
++	LOGF("Device memory stats: usage=%llu budget=%llu\n",
 +	     static_cast<unsigned long long>(GetGraphics().GetDeviceMemoryUsage()),
 +	     static_cast<unsigned long long>(GetGraphics().GetTotalMemoryBudget()));
 +}
