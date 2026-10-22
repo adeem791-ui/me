@@ -1,0 +1,46 @@
+name: CPU GPU telemetry smoke test
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/SAMPLE_EMULATOR_PERFORMANCE.ps1'
+      - 'scripts/START_WITH_TELEMETRY.cmd'
+      - '.github/workflows/telemetry-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-telemetry:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse Windows PowerShell script
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $parseErrors = $null
+          $scriptFile = Join-Path $env:GITHUB_WORKSPACE 'scripts/SAMPLE_EMULATOR_PERFORMANCE.ps1'
+          [System.Management.Automation.Language.Parser]::ParseFile($scriptFile, [ref]$tokens, [ref]$parseErrors) | Out-Null
+          if ($parseErrors.Count -gt 0) {
+            $parseErrors | Format-List | Out-String | Write-Host
+            throw "PowerShell syntax errors detected"
+          }
+      - name: Sample this test runner without a GPU
+        shell: pwsh
+        run: |
+          $dest = Join-Path $env:RUNNER_TEMP 'telemetry-smoke'
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/SAMPLE_EMULATOR_PERFORMANCE.ps1 -DurationSeconds 10 -IntervalSeconds 1 -ProcessName powershell -OutputDirectory $dest
+          if ($LASTEXITCODE -ne 0) { throw "PowerShell sampler failed" }
+          $files = @(Get-ChildItem $dest -Filter 'performance-*.csv')
+          if ($files.Count -ne 1) { throw "Expected exactly one CSV file" }
+          $data = @(Import-Csv -LiteralPath $files[0].FullName)
+          if ($data.Count -lt 2) { throw "Need two CPU samples to compute a delta" }
+          if (!($data | Where-Object { $_.cpu_core_equivalents -ne '' } | Select-Object -First 1)) {
+            throw "No valid CPU delta recorded"
+          }
+          if ($data[0].PSObject.Properties.Name -notcontains 'gpu_utilization_whole_pct') {
+            throw "Whole-GPU column missing"
+          }
