@@ -9,6 +9,9 @@
 #include <vulkan/vulkan.h>
 #include <xxhash.h>
 
+#include "prewarm_device_profile.h"
+#include "prewarm_device_profile_selftest.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -91,6 +94,7 @@ struct VkApi {
     PFN_vkGetPhysicalDeviceProperties getPhysicalDeviceProperties = nullptr;
     PFN_vkGetPhysicalDeviceQueueFamilyProperties getQueues = nullptr;
     PFN_vkGetPhysicalDeviceFeatures2 getFeatures2 = nullptr;
+    PFN_vkGetPhysicalDeviceProperties2 getProperties2 = nullptr;
     PFN_vkEnumerateDeviceExtensionProperties enumerateDeviceExtensions = nullptr;
     PFN_vkCreateDevice createDevice = nullptr;
     PFN_vkDestroyDevice destroyDevice = nullptr;
@@ -135,6 +139,7 @@ struct VkApi {
         LOAD_I(getPhysicalDeviceProperties, GetPhysicalDeviceProperties);
         LOAD_I(getQueues, GetPhysicalDeviceQueueFamilyProperties);
         LOAD_I(getFeatures2, GetPhysicalDeviceFeatures2);
+        LOAD_I(getProperties2, GetPhysicalDeviceProperties2);
         LOAD_I(enumerateDeviceExtensions, EnumerateDeviceExtensionProperties);
         LOAD_I(createDevice, CreateDevice);
         getDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(getInstanceProcAddr(instance, "vkGetDeviceProcAddr"));
@@ -287,6 +292,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL LoaderTestGetProcAddr(VkInstance instan
     static constexpr const char* instance_names[] = {
         "vkDestroyInstance", "vkEnumeratePhysicalDevices", "vkGetPhysicalDeviceProperties",
         "vkGetPhysicalDeviceQueueFamilyProperties", "vkGetPhysicalDeviceFeatures2",
+        "vkGetPhysicalDeviceProperties2",
         "vkEnumerateDeviceExtensionProperties", "vkCreateDevice", "vkGetDeviceProcAddr"
     };
     for (const auto* allowed : instance_names) {
@@ -335,6 +341,8 @@ int SelfTest() {
                            loader_test.createInstance == create_instance_proc &&
                            loader_test.destroyInstance != nullptr;
     success = success && loader_ok;
+    // Device setup must match the emulator's (robustness etc.) without enabling absent features.
+    success = KytyPrewarm::DeviceProfileSelfTest() && success;
     std::cout << (loader_ok ? "Vulkan loader lookup self-test: PASS\n"
                             : "Vulkan loader lookup self-test: FAIL\n");
     std::error_code ec;
@@ -420,26 +428,25 @@ int wmain(int argc, wchar_t** argv) {
     api.enumerateDeviceExtensions(selected, nullptr, &ecnt, nullptr);
     std::vector<VkExtensionProperties> exts(ecnt);
     if (ecnt) api.enumerateDeviceExtensions(selected, nullptr, &ecnt, exts.data());
-    const auto has_ext = [&](const char* name) {
-        return std::any_of(exts.begin(), exts.end(), [&](const auto& ext){ return std::strcmp(ext.extensionName, name) == 0; });
-    };
-    const bool push_descriptor = has_ext(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
-    std::vector<const char*> enabled_extensions;
-    if (push_descriptor) enabled_extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
-    VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-    VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    f2.pNext = &f12; f12.pNext = &f13;
-    api.getFeatures2(selected, &f2);
-    const bool subgroup = f13.subgroupSizeControl == VK_TRUE;
+    // Match the emulator's device setup so the driver produces cache entries it will reuse.
+    KytyPrewarm::SupportedDevice supported;
+    for (const auto& ext : exts) supported.extensions.emplace_back(ext.extensionName);
+    supported.QueryChain();
+    api.getFeatures2(selected, &supported.f2);
+    api.getProperties2(selected, &supported.p2);
+    KytyPrewarm::DeviceProfile profile;
+    KytyPrewarm::BuildDeviceProfile(supported, profile);
+    std::cout << KytyPrewarm::Describe(profile) << "\n";
+    const bool push_descriptor = profile.push_descriptor;
+    const bool subgroup = profile.subgroup_size_control;
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qc{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qc.queueFamilyIndex = queue_index; qc.queueCount = 1; qc.pQueuePriorities = &priority;
     VkDeviceCreateInfo dc{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    dc.pNext = &f2;
+    dc.pNext = profile.CreateChain();
     dc.queueCreateInfoCount = 1; dc.pQueueCreateInfos = &qc;
-    dc.enabledExtensionCount = static_cast<uint32_t>(enabled_extensions.size());
-    dc.ppEnabledExtensionNames = enabled_extensions.data();
+    dc.enabledExtensionCount = static_cast<uint32_t>(profile.extensions.size());
+    dc.ppEnabledExtensionNames = profile.extensions.data();
     VkDevice device = VK_NULL_HANDLE;
     VkResult create_result = api.createDevice(selected, &dc, nullptr, &device);
     if (create_result != VK_SUCCESS || !api.Init(instance, device)) {
