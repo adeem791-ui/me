@@ -44,3 +44,6 @@ jobs:
           if ($data[0].PSObject.Properties.Name -notcontains 'gpu_utilization_whole_pct') {
             throw "Whole-GPU column missing"
           }
+          if ($data[0].PSObject.Properties.Name -notcontains 'gpu_query_duration_ms') {
+            throw "GPU query overhead column missing"
+          }
