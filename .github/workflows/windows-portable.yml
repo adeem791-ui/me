@@ -276,6 +276,8 @@ jobs:
           Copy-Item 'scripts/START_GPU_CPU_PROFILE.cmd' (Join-Path $dest 'START_GPU_CPU_PROFILE.cmd')
           Copy-Item 'scripts/PROFILE_CPU_THREADS.cmd' (Join-Path $dest 'PROFILE_CPU_THREADS.cmd')
           Copy-Item 'scripts/PROFILE_CPU_THREADS.ps1' (Join-Path $dest 'PROFILE_CPU_THREADS.ps1')
+          Copy-Item 'scripts/MONITOR_CPU_GPU.cmd' (Join-Path $dest 'MONITOR_CPU_GPU.cmd')
+          Copy-Item 'scripts/MONITOR_CPU_GPU.ps1' (Join-Path $dest 'MONITOR_CPU_GPU.ps1')
           Copy-Item 'docs/GPU_CPU_PROFILING.md' (Join-Path $dest 'GPU_CPU_PROFILING.md')
           Copy-Item 'docs/compute-prewarm-v02.md' (Join-Path $dest 'COMPUTE_PREWARM_README.md')
           @'
