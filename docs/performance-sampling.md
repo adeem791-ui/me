@@ -28,6 +28,7 @@ The one-click launcher uses the installed KytyPS5 executable. The `.ps1` script 
 | `ram_working_set_mib` / `private_memory_mib` | Windows process memory counters. |
 | `gpu_utilization_whole_pct` | **Whole GPU** utilization from NVIDIA's `nvidia-smi`; could include other applications, and is not per-emulator usage. |
 | `vram_used_whole_mib` / `vram_total_whole_mib` | Whole-GPU VRAM usage and total capacity reported by `nvidia-smi`; not Vulkan's per-heap budget. |
+| `gpu_query_duration_ms` | Wall-clock overhead of each external `nvidia-smi` query, including process startup; monitor this to avoid confusing instrumentation overhead with emulator stalls. |
 
 First CPU sample for a PID is blank until a second sample supplies a time delta. Counters may be blank when the target process or NVIDIA utility is unavailable. If there are multiple NVIDIA GPUs, the script prefers a GPU whose name includes `5080`; otherwise it uses the first. No attempt is made to change CPU affinity, power plans, GPU scheduling, Vulkan synchronization, or priority.
 
