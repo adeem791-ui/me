@@ -141,18 +141,19 @@ index 00000000..2c59b423
 +
 +#endif // GRAPHICS_HOST_GPU_RENDERER_PIPELINE_DRIVER_CACHE_FILE_H_
 diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
-index fe81f3e2..78214a72 100644
+index fe81f3e2..5d345c53 100644
 --- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
 +++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
-@@ -14,6 +14,7 @@
- #include "graphics/host_gpu/renderer/depthRenderTarget.h"
- #include "graphics/host_gpu/renderer/image/imageView.h"
- #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+@@ -20,6 +20,8 @@
+ #include "graphics/shader/shaderCompiler.h"
+ #include "kernel/memory.h"
+ #include "loader/systemContent.h"
++// Kept apart from the include block above so patch 06-record-known-compute-pipelines applies too.
 +#include "graphics/host_gpu/renderer/pipeline/driverCacheFile.h"
- #include "graphics/host_gpu/renderer/render.h"
- #include "graphics/host_gpu/renderer/renderContext.h"
- #include "graphics/shader/recompiler/ShaderRecompiler.h"
-@@ -77,15 +78,14 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
+ 
+ #include <algorithm>
+ #include <array>
+@@ -77,15 +79,14 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
  }
  
  std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
@@ -175,7 +176,7 @@ index fe81f3e2..78214a72 100644
  }
  
  std::string PipelineCacheTitleId() {
-@@ -578,6 +578,9 @@ void PipelineCache::InitializeDriverCache() {
+@@ -578,6 +579,9 @@ void PipelineCache::InitializeDriverCache() {
  		const std::filesystem::path directory(root);
  		if (directory.is_absolute()) {
  			m_driver_cache_path = directory / (title_id + ".bin");
@@ -185,7 +186,7 @@ index fe81f3e2..78214a72 100644
  		}
  	}
  	const auto path         = Common::PathToString(m_driver_cache_path);
-@@ -589,34 +592,33 @@ void PipelineCache::InitializeDriverCache() {
+@@ -589,34 +593,33 @@ void PipelineCache::InitializeDriverCache() {
  	}
  	std::vector<uint8_t> initial_data;
  	if (cache_exists) {
@@ -245,7 +246,7 @@ index fe81f3e2..78214a72 100644
  		}
  	}
  
-@@ -684,9 +686,8 @@ void PipelineCache::Save() {
+@@ -684,9 +687,8 @@ void PipelineCache::Save() {
  		return;
  	}
  	payload.resize(size);
@@ -257,7 +258,7 @@ index fe81f3e2..78214a72 100644
  	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
  		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
  		return;
-@@ -694,15 +695,13 @@ void PipelineCache::Save() {
+@@ -694,15 +696,13 @@ void PipelineCache::Save() {
  	auto temp_path = m_driver_cache_path;
  	temp_path += ".tmp";
  	Common::File file;
