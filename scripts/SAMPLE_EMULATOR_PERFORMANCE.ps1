@@ -81,7 +81,11 @@ try {
             Start-Sleep -Seconds $IntervalSeconds
             continue
         }
+        # Measure the observer's GPU-query overhead separately from the emulator process CPU.
+        $gpuQueryTimer = [System.Diagnostics.Stopwatch]::StartNew()
         $gpu = Get-WholeGpuSample -Executable $smi
+        $gpuQueryTimer.Stop()
+        $gpuQueryDurationMs = [Math]::Round($gpuQueryTimer.Elapsed.TotalMilliseconds, 1)
         foreach ($proc in $processes) {
             try {
                 $observed = (Get-Date).ToUniversalTime()
@@ -141,6 +145,7 @@ try {
                     private_memory_mib = [Math]::Round($proc.PrivateMemorySize64 / 1MB, 1)
                     gpu_name_whole = $gpu.gpu_name
                     gpu_utilization_whole_pct = $gpu.gpu_utilization_whole_pct
+                    gpu_query_duration_ms = $gpuQueryDurationMs
                     vram_used_whole_mib = $gpu.vram_used_whole_mib
                     vram_total_whole_mib = $gpu.vram_total_whole_mib
                 }
