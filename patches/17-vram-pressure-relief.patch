@@ -1,0 +1,625 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5503e6e9..7812577e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -451,6 +451,11 @@ add_executable(lru_cache_tests EXCLUDE_FROM_ALL
+ )
+ target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
+ 
++add_executable(vram_relief_tests EXCLUDE_FROM_ALL
++	"${KYTY_TESTS_DIR}/VramReliefTests.cpp"
++)
++target_include_directories(vram_relief_tests PRIVATE ${inc_headers})
++
+ add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
+ 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
+ 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
+@@ -638,6 +643,7 @@ if(BUILD_TESTING)
+ 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
+ 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+ 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
++	add_test(NAME vram_relief COMMAND $<TARGET_FILE:vram_relief_tests>)
+ 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
+ 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
+ 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
+@@ -726,6 +732,7 @@ if(BUILD_TESTING)
+ 		vdecsw_tests
+ 		bit_array_tests
+ 		lru_cache_tests
++		vram_relief_tests
+ 		shader_vertex_metadata_tests
+ 		resource_materialization_tests
+ 		resource_tracking_tests
+diff --git a/src/graphics/host_gpu/graphicContext.h b/src/graphics/host_gpu/graphicContext.h
+index 52e08539..21f6c858 100644
+--- a/src/graphics/host_gpu/graphicContext.h
++++ b/src/graphics/host_gpu/graphicContext.h
+@@ -102,6 +102,10 @@ struct GraphicContext {
+ 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
+ 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
+ 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
++	// Device usage minus free space inside VMA's blocks: memory a new allocation cannot reuse.
++	// Freed images return space to their block first; the driver's usage drops only when a
++	// whole block is released, so this is the better measure of remaining room.
++	[[nodiscard]] uint64_t GetDeviceMemoryCommitted() const;
+ 
+ 	struct HeapUsage {
+ 		uint64_t usage        = 0; // Whole process, as reported by VK_EXT_memory_budget.
+@@ -148,6 +152,8 @@ struct VulkanImage {
+ 	VulkanImageState              state;
+ 	std::vector<VulkanImageState> subresource_states;
+ 	VmaAllocation                allocation = nullptr;
++	// Bytes VMA actually reserved for this image (can exceed the guest's data size).
++	uint64_t                     allocation_size = 0;
+ };
+ 
+ 
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+index c2616b0e..1237c684 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+@@ -2140,6 +2140,60 @@ void TextureCache::RunGarbageCollector() {
+ 	}
+ }
+ 
++TextureCache::ReclaimResult TextureCache::ReclaimUnusedImages(uint64_t bytes_wanted,
++                                                             size_t   max_images) {
++	std::scoped_lock lock {m_lock};
++	ReclaimResult    result;
++	if (m_gc_tick == 0 || bytes_wanted == 0 || max_images == 0) {
++		return result;
++	}
++	// Everything touched since the last collector pass carries tick m_gc_tick, including every
++	// image recorded into the open command buffer since then, so it is excluded here. Older GPU
++	// work is protected by DeleteImage's deferred destruction.
++	std::vector<ImageId> candidates;
++	candidates.reserve(std::min<size_t>(max_images * 2, 8192));
++	m_lru_cache.ForEachItemBelow(m_gc_tick - 1, [&](ImageId id) {
++		candidates.push_back(id);
++		return candidates.size() >= max_images * 2;
++	});
++	for (const auto id: candidates) {
++		if (result.images >= max_images || result.bytes >= bytes_wanted) {
++			break;
++		}
++		auto* owner = m_slot_images.try_get(id);
++		if (owner == nullptr || !owner->registered || owner->depth_id) {
++			continue; // stencil associations go with their depth owner
++		}
++		if (owner->heap_refs.load(std::memory_order_relaxed) != 0u) {
++			continue; // resident image heaps sample it without touching it
++		}
++		if (owner->IsGpuModified()) {
++			continue; // contents exist only on the GPU; never dropped here
++		}
++		// Freeing a depth owner also frees its stencil associations (DeleteImage), which would
++		// drop any stencil contents that exist only on the GPU.
++		const bool stencil_modified =
++		    std::any_of(owner->stencil_ids.begin(), owner->stencil_ids.end(), [&](ImageId stencil) {
++			    const auto* association = m_slot_images.try_get(stencil);
++			    return association != nullptr && association->IsGpuModified();
++		    });
++		if (stencil_modified) {
++			continue;
++		}
++		uint64_t bytes = owner->AccountedSize();
++		for (const auto stencil: owner->stencil_ids) {
++			if (const auto* association = m_slot_images.try_get(stencil)) {
++				bytes += association->AccountedSize();
++			}
++		}
++		FreeImage(id);
++		result.images++;
++		result.bytes += bytes;
++		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
++	}
++	return result;
++}
++
+ void TextureCache::LogMemoryStats() {
+ 	std::scoped_lock lock {m_lock};
+ 	size_t           images    = 0;
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.h b/src/graphics/host_gpu/renderer/cache/textureCache.h
+index f1402d54..a62961c9 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.h
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.h
+@@ -80,6 +80,16 @@ public:
+ 	void UnmapMemory(uint64_t address, uint64_t size);
+ 	void ProcessDownloadImages();
+ 	void RunGarbageCollector();
++	struct ReclaimResult {
++		size_t   images = 0;
++		uint64_t bytes  = 0; // accounted bytes; VRAM is released once the GPU passes their tick
++	};
++	// Mid-submission VRAM relief (RenderContext::RelieveMemoryPressure). Evicts, oldest first,
++	// only images not touched since the last RunGarbageCollector pass, with the same safety
++	// rules as the collector, and never GPU-modified images. Does not advance the GC tick, so
++	// it does not age the working set. Call only when no texture-cache lock or image
++	// reference is held (the start of a draw or dispatch).
++	ReclaimResult ReclaimUnusedImages(uint64_t bytes_wanted, size_t max_images);
+ 	void LogMemoryStats();
+ 
+ private:
+diff --git a/src/graphics/host_gpu/renderer/image/image.cpp b/src/graphics/host_gpu/renderer/image/image.cpp
+index fc0cebbc..8fb9562a 100644
+--- a/src/graphics/host_gpu/renderer/image/image.cpp
++++ b/src/graphics/host_gpu/renderer/image/image.cpp
+@@ -736,9 +736,12 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
+ 	}
+ 
+ 	if (!graphics.CreateImage(create, backing)) {
+-		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
++		// Reached only if VRAM relief (RenderContext::RelieveMemoryPressure) could not keep
++		// enough room; the vmaCreateImage line just above in the log has the full details.
++		EXIT("failed to create image: extent=%ux%ux%u format=%d (%s) layers=%u levels=%u\n",
+ 		     create.extent.width, create.extent.height, create.extent.depth,
+-		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
++		     static_cast<int>(create.format), vk::to_string(create.format).c_str(),
++		     create.arrayLayers, create.mipLevels);
+ 	}
+ 	SetVulkanObjectNameF(
+ 	    graphics.device, backing.image,
+diff --git a/src/graphics/host_gpu/renderer/image/image.h b/src/graphics/host_gpu/renderer/image/image.h
+index b3c5ae3d..ee7521a7 100644
+--- a/src/graphics/host_gpu/renderer/image/image.h
++++ b/src/graphics/host_gpu/renderer/image/image.h
+@@ -7,6 +7,7 @@
+ #include "graphics/host_gpu/graphicContext.h"
+ #include "graphics/host_gpu/renderer/image/imageInfo.h"
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <compare>
+ #include <limits>
+@@ -123,7 +124,12 @@ public:
+ 	}
+ 	[[nodiscard]] bool IsTracked() const noexcept { return track_addr != 0 && track_addr_end != 0; }
+ 	[[nodiscard]] uint64_t AccountedSize() const noexcept {
+-		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
++		// Count what the GPU actually holds: the host allocation can be larger than the guest
++		// data (alignment, padding, format expansion), which made the cache under-count VRAM.
++		return backing.image == nullptr
++		           ? 0
++		           : std::max<uint64_t>(Common::AlignUp(info.data.size, 1024),
++		                                backing.allocation_size);
+ 	}
+ 	[[nodiscard]] uint64_t HashGuestEdges() const;
+ 	[[nodiscard]] vk::ImageLayout ReadLayout() const noexcept {
+diff --git a/src/graphics/host_gpu/renderer/renderCompute.cpp b/src/graphics/host_gpu/renderer/renderCompute.cpp
+index 93e22514..22664b72 100644
+--- a/src/graphics/host_gpu/renderer/renderCompute.cpp
++++ b/src/graphics/host_gpu/renderer/renderCompute.cpp
+@@ -248,6 +248,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
+                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
+ 	EXIT_IF(buffer.IsInvalid());
+ 	m_context.GetCommandScheduler().PopPendingOperations();
++	m_context.RelieveMemoryPressure();
+ 	auto& ctx    = buffer.GetRegisters();
+ 	auto& sh_ctx = buffer.GetShaders();
+ 
+@@ -484,6 +485,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
+ 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
+ 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
+ 	m_context.GetCommandScheduler().PopPendingOperations();
++	m_context.RelieveMemoryPressure();
+ 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
+ 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
+ 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
+diff --git a/src/graphics/host_gpu/renderer/renderContext.cpp b/src/graphics/host_gpu/renderer/renderContext.cpp
+index 5ddb2c91..5d30fa38 100644
+--- a/src/graphics/host_gpu/renderer/renderContext.cpp
++++ b/src/graphics/host_gpu/renderer/renderContext.cpp
+@@ -1,12 +1,18 @@
+ #include "graphics/host_gpu/renderer/renderContext.h"
+ 
+ #include "common/assert.h"
++#include "common/debugCounters.h"
+ #include "common/logging/log.h"
+ #include "graphics/guest_gpu/graphicsRun.h"
++#include "graphics/host_gpu/renderer/vramRelief.h"
+ #include "graphics/presentation/videoOut.h"
+ #include "libs/errno.h"
+ 
+ #include <algorithm>
++#include <chrono>
++#include <cinttypes>
++#include <cstdlib>
++#include <cstring>
+ 
+ namespace Libs::Graphics {
+ 
+@@ -138,13 +144,142 @@ void RenderContext::PrepareBda() {
+ 	m_fault_process_pending = true;
+ }
+ 
++namespace {
++
++struct VramReliefSettings {
++	bool     enabled  = true;
++	uint64_t headroom = 1024ull * 1024 * 1024;
++};
++
++const VramReliefSettings& GetVramReliefSettings() {
++	static const VramReliefSettings settings = [] {
++		VramReliefSettings out;
++		if (const char* value = std::getenv("KYTY_VRAM_RECOVERY"); value != nullptr) {
++			out.enabled = std::strcmp(value, "0") != 0;
++		}
++		if (const char* value = std::getenv("KYTY_VRAM_HEADROOM_MB"); value != nullptr) {
++			const auto mb = std::strtoull(value, nullptr, 10);
++			out.headroom  = std::clamp<uint64_t>(mb, 256, 4096) * 1024 * 1024;
++		}
++		LOGF("VRAM relief: %s, headroom=%" PRIu64 " MiB (KYTY_VRAM_RECOVERY, KYTY_VRAM_HEADROOM_MB)\n",
++		     out.enabled ? "enabled" : "disabled", out.headroom / (1024 * 1024));
++		return out;
++	}();
++	return settings;
++}
++
++} // namespace
++
++void RenderContext::RelieveMemoryPressure() {
++	const auto& settings = GetVramReliefSettings();
++	auto&       graphics = GetGraphics();
++	if (!settings.enabled || !graphics.CanReportMemoryUsage()) {
++		return;
++	}
++	const uint64_t budget = graphics.GetTotalMemoryBudget();
++	if (budget == 0) {
++		return;
++	}
++	using VramRelief::MiB;
++	const uint64_t before = graphics.GetDeviceMemoryCommitted();
++	// When relief last found nothing to release, Decide does not stall the GPU again on every
++	// draw; it retries once usage has grown by another VramRelief::RetryGrowth.
++	const auto plan = VramRelief::Decide(budget, settings.headroom, before, m_vram_relief.stuck_at);
++	if (before < plan.trigger) {
++		m_vram_relief.stuck_at = 0;
++	}
++	if (!plan.act) {
++		return;
++	}
++	const uint64_t trigger = plan.trigger;
++	const uint64_t target  = plan.target;
++	const auto     start   = std::chrono::steady_clock::now();
++	m_vram_relief.attempts++;
++	const auto reclaim = m_texture_cache.ReclaimUnusedImages(before - target, 4096);
++	m_vram_relief.images += reclaim.images;
++	m_vram_relief.bytes += reclaim.bytes;
++
++	// Evicted (and earlier collected) images are destroyed only once the GPU passes the tick
++	// they were last used at. Finish here, at a draw/dispatch boundary where the scheduler may
++	// be restarted, so the memory is back before this draw allocates.
++	bool waited = false;
++	if ((reclaim.images > 0 || m_command_scheduler.PendingOperationCount() > 0) &&
++	    m_command_scheduler.Active() && !CommandScheduler::InDeferredOperation()) {
++		m_command_scheduler.Finish();
++		m_vram_relief.gpu_waits++;
++		waited = true;
++	}
++	const uint64_t after = graphics.GetDeviceMemoryCommitted();
++	m_vram_relief.reclaimed += before > after ? before - after : 0;
++	m_vram_relief.stuck_at = after >= trigger ? std::max<uint64_t>(after, 1) : 0;
++	const auto elapsed_ms = std::chrono::duration<double, std::milli>(
++	                            std::chrono::steady_clock::now() - start)
++	                            .count();
++	if (m_vram_relief.logged < 32 || (m_vram_relief.attempts % 64) == 0) {
++		m_vram_relief.logged++;
++		LOGF("VRAM relief #%" PRIu64 ": committed_before=%" PRIu64 "MiB budget=%" PRIu64
++		     "MiB trigger=%" PRIu64 "MiB evicted_images=%zu evicted=%" PRIu64
++		     "MiB gpu_wait=%d committed_after=%" PRIu64 "MiB released=%" PRId64 "MiB took=%.1fms%s\n",
++		     m_vram_relief.attempts, before / MiB, budget / MiB, trigger / MiB, reclaim.images,
++		     reclaim.bytes / MiB, waited ? 1 : 0, after / MiB,
++		     (static_cast<int64_t>(before) - static_cast<int64_t>(after)) / static_cast<int64_t>(MiB),
++		     elapsed_ms,
++		     after >= trigger ? " (still above trigger: nothing more is safely evictable now)" : "");
++	}
++}
++
+ void RenderContext::LogMemoryStats() {
+ 	m_texture_cache.LogMemoryStats();
+ 	m_buffer_cache.LogMemoryStats();
+ 	LOGF("Scheduler stats: pending_operations=%zu\n", m_command_scheduler.PendingOperationCount());
+-	LOGF("Device memory stats: usage=%llu budget=%llu\n",
+-	     static_cast<unsigned long long>(GetGraphics().GetDeviceMemoryUsage()),
+-	     static_cast<unsigned long long>(GetGraphics().GetTotalMemoryBudget()));
++	auto& graphics = GetGraphics();
++	LOGF("Device memory stats: usage=%llu committed=%llu budget=%llu relief_attempts=%" PRIu64
++	     " relief_gpu_waits=%" PRIu64 " relief_evicted_images=%" PRIu64
++	     " relief_released_mib=%" PRIu64 "\n",
++	     static_cast<unsigned long long>(graphics.GetDeviceMemoryUsage()),
++	     static_cast<unsigned long long>(graphics.GetDeviceMemoryCommitted()),
++	     static_cast<unsigned long long>(graphics.GetTotalMemoryBudget()), m_vram_relief.attempts,
++	     m_vram_relief.gpu_waits, m_vram_relief.images, m_vram_relief.reclaimed / (1024 * 1024));
++	LogHeartbeat();
++}
++
++void RenderContext::LogHeartbeat() {
++	// One line per 5 s telling which stage keeps moving during a black screen. CPU-side counts
++	// only: gpu_wait_ms is time the CPU spent blocked on the GPU, not GPU execution time.
++	using Common::DebugCounters::Counter;
++	if (!Common::DebugCounters::Enabled()) {
++		static bool told = false;
++		if (!told) {
++			told = true;
++			LOGF("Heartbeat: counters are off; start with --perf-overlay true (or press F2) to "
++			     "log draws/submits/flips every 5 s\n");
++		}
++		return;
++	}
++	static constexpr Counter Tracked[] = {
++	    Counter::QueueSubmits,   Counter::Draws,           Counter::Dispatches,
++	    Counter::FlipsRequested, Counter::DroppedPresents, Counter::GpuWaits,
++	    Counter::GpuWaitNs,      Counter::PipelinesCreated, Counter::PipelineCreateNs,
++	    Counter::TextureEvictions, Counter::AudioUnderruns, Counter::GuestFileReadBytes};
++	static uint64_t last[std::size(Tracked)] {};
++	uint64_t        delta[std::size(Tracked)] {};
++	for (size_t i = 0; i < std::size(Tracked); i++) {
++		const auto now = Common::DebugCounters::Get(Tracked[i]);
++		delta[i]       = now - last[i];
++		last[i]        = now;
++	}
++	auto& master = m_command_scheduler.GetMasterSemaphore();
++	master.Refresh();
++	const uint64_t current = master.CurrentTick();
++	const uint64_t done    = master.KnownGpuTick();
++	LOGF("Heartbeat(5s): submits=%" PRIu64 " draws=%" PRIu64 " dispatches=%" PRIu64
++	     " flips_requested=%" PRIu64 " dropped_presents=%" PRIu64 " cpu_waits_on_gpu=%" PRIu64
++	     " cpu_wait_on_gpu_ms=%" PRIu64 " pipelines_created=%" PRIu64 " pipeline_create_ms=%" PRIu64
++	     " texture_evictions=%" PRIu64 " audio_underruns=%" PRIu64 " guest_file_read_kib=%" PRIu64
++	     " gpu_ticks_behind=%" PRIu64 "\n",
++	     delta[0], delta[1], delta[2], delta[3], delta[4], delta[5], delta[6] / 1000000,
++	     delta[7], delta[8] / 1000000, delta[9], delta[10], delta[11] / 1024,
++	     current > done ? current - done - 1 : 0);
+ }
+ 
+ void RenderContext::RunGarbageCollector() {
+diff --git a/src/graphics/host_gpu/renderer/renderContext.h b/src/graphics/host_gpu/renderer/renderContext.h
+index 1a8b38e5..7b9814d0 100644
+--- a/src/graphics/host_gpu/renderer/renderContext.h
++++ b/src/graphics/host_gpu/renderer/renderContext.h
+@@ -57,13 +57,29 @@ public:
+ 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+ 	void               PrepareBda();
+ 	void               RunGarbageCollector();
++	// Called at the start of every draw and dispatch. When committed VRAM nears the budget,
++	// evicts idle textures and lets the GPU finish so their memory is actually released,
++	// instead of waiting for the next submission boundary. KYTY_VRAM_RECOVERY=0 disables it.
++	void RelieveMemoryPressure();
+ 	void LogMemoryStats();
++	void LogHeartbeat();
+ 
+ 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
+ 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
+ 	void TriggerInterrupt(int event_id, uint32_t context_id);
+ 
+ private:
++	struct VramReliefStats {
++		uint64_t attempts       = 0;
++		uint64_t gpu_waits      = 0;
++		uint64_t images         = 0;
++		uint64_t bytes          = 0;
++		uint64_t reclaimed      = 0; // committed bytes released, measured after the wait
++		uint64_t stuck_at       = 0; // committed bytes when relief last could not get under
++		uint64_t logged         = 0;
++	};
++	VramReliefStats m_vram_relief;
++
+ 	struct InterruptEqRegistration {
+ 		LibKernel::EventQueue::KernelEqueue eq       = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
+ 		int                                 event_id = 0;
+diff --git a/src/graphics/host_gpu/renderer/renderDraw.cpp b/src/graphics/host_gpu/renderer/renderDraw.cpp
+index 717b9728..4ea55439 100644
+--- a/src/graphics/host_gpu/renderer/renderDraw.cpp
++++ b/src/graphics/host_gpu/renderer/renderDraw.cpp
+@@ -1344,6 +1344,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
+ 	EXIT_IF(buffer.IsInvalid());
+ 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
+ 	m_context.GetCommandScheduler().PopPendingOperations();
++	m_context.RelieveMemoryPressure();
+ 	auto& ucfg   = buffer.GetUserConfig();
+ 	auto& sh_ctx = buffer.GetShaders();
+ 
+@@ -1451,6 +1452,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
+ 	EXIT_IF(buffer.IsInvalid());
+ 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
+ 	m_context.GetCommandScheduler().PopPendingOperations();
++	m_context.RelieveMemoryPressure();
+ 	auto& ucfg   = buffer.GetUserConfig();
+ 	auto& sh_ctx = buffer.GetShaders();
+ 
+diff --git a/src/graphics/host_gpu/renderer/vramRelief.h b/src/graphics/host_gpu/renderer/vramRelief.h
+new file mode 100644
+index 00000000..d74f2b2b
+--- /dev/null
++++ b/src/graphics/host_gpu/renderer/vramRelief.h
+@@ -0,0 +1,45 @@
++#ifndef GRAPHICS_HOST_GPU_RENDERER_VRAM_RELIEF_H_
++#define GRAPHICS_HOST_GPU_RENDERER_VRAM_RELIEF_H_
++
++// When RenderContext::RelieveMemoryPressure acts. Pure, so it can be tested without a GPU.
++
++#include <algorithm>
++#include <cstdint>
++
++namespace Libs::Graphics::VramRelief {
++
++inline constexpr uint64_t MiB = 1024ull * 1024;
++// After relief fails to get under the trigger, wait for this much more growth before trying
++// (and stalling the GPU) again.
++inline constexpr uint64_t RetryGrowth = 256 * MiB;
++
++struct Plan {
++	bool     act    = false;
++	uint64_t target = 0; // committed bytes to evict down to (hysteresis below the trigger)
++	uint64_t trigger = 0;
++};
++
++// budget: GraphicContext::GetTotalMemoryBudget(); committed: GetDeviceMemoryCommitted();
++// stuck_at: committed bytes when the last attempt could not get under the trigger (0 = none).
++[[nodiscard]] inline Plan Decide(uint64_t budget, uint64_t headroom, uint64_t committed,
++                                 uint64_t stuck_at) {
++	Plan plan;
++	if (budget == 0) {
++		return plan;
++	}
++	headroom     = std::min<uint64_t>(headroom, budget / 4);
++	plan.trigger = budget - headroom;
++	plan.target  = std::max<uint64_t>(budget - std::min<uint64_t>(2 * headroom, budget), budget / 2);
++	if (committed < plan.trigger) {
++		return plan;
++	}
++	if (stuck_at != 0 && committed < stuck_at + RetryGrowth) {
++		return plan;
++	}
++	plan.act = true;
++	return plan;
++}
++
++} // namespace Libs::Graphics::VramRelief
++
++#endif // GRAPHICS_HOST_GPU_RENDERER_VRAM_RELIEF_H_
+diff --git a/src/graphics/host_gpu/vma.cpp b/src/graphics/host_gpu/vma.cpp
+index 937995aa..67681b39 100644
+--- a/src/graphics/host_gpu/vma.cpp
++++ b/src/graphics/host_gpu/vma.cpp
+@@ -97,6 +97,31 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
+ 	return usage;
+ }
+ 
++uint64_t GraphicContext::GetDeviceMemoryCommitted() const {
++	if (!CanReportMemoryUsage() || allocator == nullptr) {
++		return 0;
++	}
++	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
++	vmaGetHeapBudgets(allocator, budgets);
++	const bool discrete =
++	    physical_device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
++	uint64_t committed = 0;
++	for (uint32_t heap = 0; heap < physical_device_memory_properties.memoryHeapCount; heap++) {
++		const bool device_local =
++		    static_cast<bool>(physical_device_memory_properties.memoryHeaps[heap].flags &
++		                      vk::MemoryHeapFlagBits::eDeviceLocal);
++		if (discrete && !device_local) {
++			continue;
++		}
++		const uint64_t usage  = budgets[heap].usage;
++		const uint64_t blocks = budgets[heap].statistics.blockBytes;
++		const uint64_t used   = budgets[heap].statistics.allocationBytes;
++		const uint64_t free_in_blocks = blocks > used ? blocks - used : 0;
++		committed += usage > free_in_blocks ? usage - free_in_blocks : 0;
++	}
++	return committed;
++}
++
+ uint32_t GraphicContext::GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const {
+ 	if (allocator == nullptr) {
+ 		return 0;
+@@ -159,13 +184,27 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
+ 	                   &alloc_info, &native_image, &image.allocation, nullptr));
+ 	image.image = native_image;
+ 	if (result != vk::Result::eSuccess) {
+-		LOGF("vmaCreateImage failed: result=%s extent=%ux%ux%u format=%u layers=%u levels=%u\n",
++		// VMA has already destroyed the image and released any memory on failure, so no handle
++		// or allocation is left behind. Ask the driver how much the image would have needed.
++		vk::DeviceImageMemoryRequirements query {};
++		query.pCreateInfo = &image_info;
++		vk::MemoryRequirements2 required {};
++		device.getImageMemoryRequirements(&query, &required);
++		LOGF("vmaCreateImage failed: result=%s extent=%ux%ux%u format=%u (%s) layers=%u levels=%u "
++		     "samples=%u tiling=%s usage=%s flags=%s required_bytes=%" PRIu64 "\n",
+ 		     vk::to_string(result).c_str(), image_info.extent.width, image_info.extent.height,
+ 		     image_info.extent.depth, static_cast<uint32_t>(image_info.format),
+-		     image_info.arrayLayers, image_info.mipLevels);
++		     vk::to_string(image_info.format).c_str(), image_info.arrayLayers,
++		     image_info.mipLevels, static_cast<uint32_t>(image_info.samples),
++		     vk::to_string(image_info.tiling).c_str(), vk::to_string(image_info.usage).c_str(),
++		     vk::to_string(image_info.flags).c_str(),
++		     static_cast<uint64_t>(required.memoryRequirements.size));
+ 		LogMemoryBudget();
+ 		return false;
+ 	}
++	VmaAllocationInfo allocation_info {};
++	vmaGetAllocationInfo(allocator, image.allocation, &allocation_info);
++	image.allocation_size = allocation_info.size;
+ 
+ 	image.format     = image_info.format;
+ 	image.image_type = image_info.imageType;
+@@ -186,8 +225,9 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
+ 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
+ 
+ 	vmaDestroyImage(allocator, image.image, image.allocation);
+-	image.image      = nullptr;
+-	image.allocation = nullptr;
++	image.image           = nullptr;
++	image.allocation      = nullptr;
++	image.allocation_size = 0;
+ }
+ 
+ } // namespace Libs::Graphics
+diff --git a/tests/VramReliefTests.cpp b/tests/VramReliefTests.cpp
+new file mode 100644
+index 00000000..9213df03
+--- /dev/null
++++ b/tests/VramReliefTests.cpp
+@@ -0,0 +1,60 @@
++#include "graphics/host_gpu/renderer/vramRelief.h"
++
++#include <cstdio>
++#include <cstdlib>
++
++// When the mid-submission VRAM relief acts. No GPU needed.
++
++namespace {
++
++using namespace Libs::Graphics::VramRelief;
++constexpr uint64_t GiB = 1024 * MiB;
++
++void Check(bool value, const char* message) {
++	if (!value) {
++		std::fprintf(stderr, "VramReliefTests: failed: %s\n", message);
++		std::abort();
++	}
++}
++
++void TestNoBudget() {
++	Check(!Decide(0, GiB, 100 * GiB, 0).act, "no budget reported: never act");
++}
++
++void TestTriggerAndTarget() {
++	// Ahmad's RTX 5080: VMA budget 15.16 GB; GetTotalMemoryBudget keeps 1 GiB back -> ~14.1 GB.
++	const uint64_t budget = 14119 * MiB;
++	const auto     below  = Decide(budget, GiB, budget - GiB - 1, 0);
++	Check(!below.act, "below trigger: no action");
++	Check(below.trigger == budget - GiB, "trigger is budget minus headroom");
++	Check(below.target == budget - 2 * GiB, "target leaves two headrooms below budget");
++	Check(Decide(budget, GiB, budget - GiB, 0).act, "at trigger: act");
++	Check(Decide(budget, GiB, budget + GiB, 0).act, "over budget: act");
++}
++
++void TestHeadroomCapped() {
++	// A huge configured headroom must not make relief run all the time on a small GPU.
++	const uint64_t budget = 4 * GiB;
++	const auto     plan   = Decide(budget, 4 * GiB, 0, 0);
++	Check(plan.trigger == budget - GiB, "headroom capped at a quarter of the budget");
++	Check(plan.target >= budget / 2, "target never below half the budget");
++}
++
++void TestRetryBackoff() {
++	const uint64_t budget = 14 * GiB;
++	const uint64_t stuck  = 13 * GiB + 512 * MiB;
++	Check(!Decide(budget, GiB, stuck, stuck).act, "no retry at the same level after a failed attempt");
++	Check(!Decide(budget, GiB, stuck + RetryGrowth - 1, stuck).act, "no retry before 256 MiB growth");
++	Check(Decide(budget, GiB, stuck + RetryGrowth, stuck).act, "retry after 256 MiB growth");
++}
++
++} // namespace
++
++int main() {
++	TestNoBudget();
++	TestTriggerAndTarget();
++	TestHeadroomCapped();
++	TestRetryBackoff();
++	std::printf("VramReliefTests: all tests passed\n");
++	return 0;
++}

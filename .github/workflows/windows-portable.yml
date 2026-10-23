@@ -52,6 +52,16 @@ jobs:
           git -C source apply --check "$patch" || { echo "::error::consolidated patch does not apply"; exit 1; }
           git -C source apply "$patch"
           echo "applied 01-16-rebased-on-9dcff95.patch"
+          patch="$GITHUB_WORKSPACE/patches/17-vram-pressure-relief.patch"
+          git -C source apply --check "$patch" || { echo "::error::patch 17 does not apply"; exit 1; }
+          git -C source apply "$patch"
+          echo "applied 17-vram-pressure-relief.patch"
+
+      - name: VRAM relief policy test (GCC, ASan + UBSan)
+        run: |
+          g++ -std=c++20 -Wall -Wextra -Werror -fsanitize=address,undefined -Isource/src \
+            source/tests/VramReliefTests.cpp -o vram_relief_tests
+          ./vram_relief_tests
 
       - name: Device-profile self-test
         run: |
@@ -89,6 +99,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Consolidated patch validation failed" }
           git -C source apply $patch
           if ($LASTEXITCODE -ne 0) { throw "Consolidated patch application failed" }
+          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/17-vram-pressure-relief.patch'
+          git -C source apply --check $patch
+          if ($LASTEXITCODE -ne 0) { throw "Patch 17 validation failed" }
+          git -C source apply $patch
+          if ($LASTEXITCODE -ne 0) { throw "Patch 17 application failed" }
 
       - name: Locate vcpkg
         id: vcpkg
@@ -128,12 +143,12 @@ jobs:
       - name: Compile launcher, emulator and shader tests
         shell: cmd
         run: |
-          cmake --build build --target launcher resource_tracking_tests scalar_provenance_tests --parallel 8
+          cmake --build build --target launcher resource_tracking_tests scalar_provenance_tests vram_relief_tests --parallel 8
 
       - name: Run shader regression tests
         shell: cmd
         run: |
-          ctest --test-dir build --output-on-failure -R "^(resource_tracking|scalar_provenance)$"
+          ctest --test-dir build --output-on-failure -R "^(resource_tracking|scalar_provenance|vram_relief)$"
 
       - name: Install portable app and assets
         shell: cmd
@@ -173,6 +188,8 @@ jobs:
           }
           Copy-Item 'source/LICENSE' (Join-Path $dest 'LICENSE_KytyPS5.txt')
           Copy-Item 'patches/01-16-rebased-on-9dcff95.patch' (Join-Path $dest '01-16-rebased-on-9dcff95.patch')
+          Copy-Item 'patches/17-vram-pressure-relief.patch' (Join-Path $dest '17-vram-pressure-relief.patch')
+          Copy-Item 'docs/vram-pressure-relief.md' (Join-Path $dest 'VRAM_RELIEF_README.md')
           Copy-Item 'scripts/START_SHARED_SHADER_CACHE.cmd' (Join-Path $dest 'START_SHARED_SHADER_CACHE.cmd')
           Copy-Item 'scripts/RECORD_COMPUTE_SHADERS.cmd' (Join-Path $dest 'RECORD_COMPUTE_SHADERS.cmd')
           Copy-Item 'scripts/PRECOMPILE_KNOWN_COMPUTE.cmd' (Join-Path $dest 'PRECOMPILE_KNOWN_COMPUTE.cmd')
@@ -192,12 +209,20 @@ jobs:
           start "" "%~dp0kyty_launcher.exe"
           '@ | Set-Content (Join-Path $dest 'TEST_DIAGNOSTIC_SKIP_CS.cmd') -Encoding ascii
           @'
+          @echo off
+          cd /d "%~dp0"
+          set "KYTY_VRAM_RECOVERY=0"
+          echo A/B baseline: VRAM relief (patch 17) is OFF for this run.
+          start "" "%~dp0kyty_launcher.exe"
+          '@ | Set-Content (Join-Path $dest 'START_WITHOUT_VRAM_RELIEF.cmd') -Encoding ascii
+          @'
           Experimental unofficial KytyPS5 Windows build based on upstream source at 9dcff95 (2026-10-23),
           76 commits ahead of the earlier 7b7f9a7 pin, including upstream fixes to GPU-driven indirect
           draws, image-heap texture residency, and a GPU-thread flip-wait stall.
           Open kyty_launcher.exe after unzipping; keep all runtime DLLs and assets together.
           Requires Windows x64 and Vulkan-capable graphics drivers.
           No development software should be required to run the finished package.
+          Includes patch 17 (VRAM pressure relief), untested on real hardware. See VRAM_RELIEF_README.md.
           Shader stack overflow patch is experimental and game compatibility is not guaranteed.
           Refer to this repository for the patch and corresponding upstream source.
           '@ | Set-Content (Join-Path $dest 'START_HERE.txt') -Encoding UTF8
@@ -205,12 +230,12 @@ jobs:
       - name: Archive portable Windows application
         shell: pwsh
         run: |
-          Compress-Archive -Path 'install/*' -DestinationPath "$env:RUNNER_TEMP/KytyPS5-Yotei-Compute-Prewarm-Experimental.zip" -CompressionLevel Optimal
+          Compress-Archive -Path 'install/*' -DestinationPath "$env:RUNNER_TEMP/KytyPS5-Yotei-VRAM-Relief-Experimental.zip" -CompressionLevel Optimal
 
       - name: Upload compiled Windows package
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Yotei-Compute-Prewarm-Experimental
-          path: ${{ runner.temp }}/KytyPS5-Yotei-Compute-Prewarm-Experimental.zip
+          name: KytyPS5-Yotei-VRAM-Relief-Experimental
+          path: ${{ runner.temp }}/KytyPS5-Yotei-VRAM-Relief-Experimental.zip
           if-no-files-found: error
           retention-days: 14
