@@ -1,0 +1,125 @@
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+index 5ee097a..bd57b58 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+@@ -1287,6 +1287,45 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+ 	return result;
+ }
+ 
++ImageId TextureCache::FindStandaloneImage(ImageDesc& desc) {
++	auto& command = m_scheduler.Current();
++	if (command.IsInvalid()) {
++		EXIT("TextureCache: image lookup requires a valid command buffer\n");
++	}
++	ValidateImageDesc(desc);
++	EXIT_IF(desc.info.data.Empty());
++	const auto metadata_base_layer = desc.view_info.base_layer;
++
++	ImageId result {};
++	{
++		std::scoped_lock lock {m_lock};
++		const auto       candidates =
++		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
++		// Reuse only an image with the exact same guest layout. No view, slice or expansion of
++		// another image is made, because the base is not a block boundary of that image.
++		for (const auto id: candidates) {
++			const auto& image = m_slot_images[id];
++			if (!image.depth_id && SameBacking(image.info, desc.info, false)) {
++				result = id;
++				break;
++			}
++		}
++		if (!result) {
++			result         = InsertImage(desc.info);
++			auto& inserted = m_slot_images[result];
++			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
++			                                    inserted.info.data.size)) {
++				inserted.MarkBufferModified();
++			}
++		}
++		auto& image              = m_slot_images[result];
++		image.tick_accessed_last = m_scheduler.CurrentTick();
++		TouchImage(image);
++	}
++	MaterializeColorClear(result, desc, metadata_base_layer);
++	return result;
++}
++
+ void TextureCache::UpdateImage(ImageId id) {
+ 	std::scoped_lock lock {m_lock};
+ 	auto&            image = m_slot_images[id];
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.h b/src/graphics/host_gpu/renderer/cache/textureCache.h
+index 762474f..17acd89 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.h
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.h
+@@ -51,6 +51,8 @@ public:
+ 	KYTY_CLASS_NO_COPY(TextureCache);
+ 
+ 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
++	// Image for a tiled base that is not 64 KB aligned: never a view of another image.
++	[[nodiscard]] ImageId       FindStandaloneImage(ImageDesc& desc);
+ 	void                        UpdateImage(ImageId id);
+ 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
+ 	                                               bool ensure_valid = true);
+diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+index 4958615..ea4bb92 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+@@ -577,25 +577,29 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
+ 		desc.info.UpdateSize();
+ 	}
+ 	const auto alignment = desc.info.DataAlignment();
+-	if (desc.info.data.size == 0 || alignment == 0 ||
+-	    (address & (static_cast<uint64_t>(alignment) - 1u)) != 0) {
+-		// Log the texture that is about to stop the emulator, so the next crash log names it.
+-		LOGF("Texture descriptor rejected: addr=0x%016llx size=0x%llx alignment=%u tiled=%d "
+-		     "tile=%u format=%u type=%u extent=%ux%ux%u levels=%u layers=%u block_bytes=%u "
+-		     "base_level=%u last_level=%u\n",
+-		     static_cast<unsigned long long>(address),
+-		     static_cast<unsigned long long>(desc.info.data.size), alignment,
+-		     desc.info.IsTiled() ? 1 : 0, static_cast<uint32_t>(tile), static_cast<uint32_t>(format),
+-		     static_cast<uint32_t>(type), static_cast<unsigned>(desc.info.extent.width),
+-		     static_cast<unsigned>(desc.info.extent.height),
+-		     static_cast<unsigned>(desc.info.extent.depth),
+-		     static_cast<unsigned>(desc.info.resources.levels),
+-		     static_cast<unsigned>(desc.info.resources.layers),
+-		     static_cast<unsigned>(desc.info.bytes_per_block), static_cast<unsigned>(base_level),
+-		     static_cast<unsigned>(last_level));
++	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0);
++	// A tiled base that is only 256-byte aligned cannot be a mip or layer slice of an emulator
++	// image, so it gets its own image instead of stopping the emulator.
++	const bool standalone = (address & (static_cast<uint64_t>(alignment) - 1u)) != 0;
++	if (standalone) {
++		static uint32_t standalone_logs = 0;
++		if (standalone_logs < 16 || (standalone_logs & 255u) == 0) {
++			LOGF("Standalone texture image (base not aligned to %u): addr=0x%016llx size=0x%llx "
++			     "tiled=%d tile=%u format=%u type=%u extent=%ux%ux%u levels=%u layers=%u "
++			     "block_bytes=%u base_level=%u last_level=%u\n",
++			     alignment, static_cast<unsigned long long>(address),
++			     static_cast<unsigned long long>(desc.info.data.size), desc.info.IsTiled() ? 1 : 0,
++			     static_cast<uint32_t>(tile), static_cast<uint32_t>(format),
++			     static_cast<uint32_t>(type), static_cast<unsigned>(desc.info.extent.width),
++			     static_cast<unsigned>(desc.info.extent.height),
++			     static_cast<unsigned>(desc.info.extent.depth),
++			     static_cast<unsigned>(desc.info.resources.levels),
++			     static_cast<unsigned>(desc.info.resources.layers),
++			     static_cast<unsigned>(desc.info.bytes_per_block), static_cast<unsigned>(base_level),
++			     static_cast<unsigned>(last_level));
++		}
++		standalone_logs++;
+ 	}
+-	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
+-	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
+ 	if (storage) {
+ 		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
+ 	}
+@@ -612,7 +616,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
+ 	desc.view_info.base_level = view_base;
+ 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+ 
+-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
++	auto       id                  = standalone ? texture_cache.FindStandaloneImage(desc)
++	                          : texture_cache.FindImage(desc, shader_conversion);
+ 	auto*      image               = &texture_cache.GetImage(id);
+ 	const bool stencil_association = static_cast<bool>(image->depth_id);
+ 	if (stencil_association) {
