@@ -206,10 +206,10 @@ index 93e22514..22664b72 100644
  	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
  	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
 diff --git a/src/graphics/host_gpu/renderer/renderContext.cpp b/src/graphics/host_gpu/renderer/renderContext.cpp
-index 5ddb2c91..5d30fa38 100644
+index 5ddb2c91..f3c72f2c 100644
 --- a/src/graphics/host_gpu/renderer/renderContext.cpp
 +++ b/src/graphics/host_gpu/renderer/renderContext.cpp
-@@ -1,12 +1,18 @@
+@@ -1,12 +1,20 @@
  #include "graphics/host_gpu/renderer/renderContext.h"
  
  #include "common/assert.h"
@@ -223,12 +223,14 @@ index 5ddb2c91..5d30fa38 100644
  #include <algorithm>
 +#include <chrono>
 +#include <cinttypes>
++#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
++#include <ctime>
  
  namespace Libs::Graphics {
  
-@@ -138,13 +144,142 @@ void RenderContext::PrepareBda() {
+@@ -138,13 +146,171 @@ void RenderContext::PrepareBda() {
  	m_fault_process_pending = true;
  }
  
@@ -335,16 +337,49 @@ index 5ddb2c91..5d30fa38 100644
 +}
 +
 +void RenderContext::LogHeartbeat() {
-+	// One line per 5 s telling which stage keeps moving during a black screen. CPU-side counts
-+	// only: gpu_wait_ms is time the CPU spent blocked on the GPU, not GPU execution time.
++	// One line per 5 s, logged from the GPU submission loop, telling which stage keeps moving
++	// during a black screen. If that loop stalls, these lines stop: the last line's local_time
++	// is when it was last alive, and since_last_ms shows gaps. Anything after that has to come
++	// from an external monitor and a screen capture. CPU-side counts only: cpu_wait_on_gpu_ms
++	// is time the CPU spent blocked on the GPU, not GPU execution time.
 +	using Common::DebugCounters::Counter;
++	static const auto start   = std::chrono::steady_clock::now();
++	static auto       last_at = start;
++	const auto        now_at  = std::chrono::steady_clock::now();
++	const auto        since_last_ms =
++	    std::chrono::duration_cast<std::chrono::milliseconds>(now_at - last_at).count();
++	const auto uptime_s = std::chrono::duration_cast<std::chrono::seconds>(now_at - start).count();
++	last_at             = now_at;
++
++	// Local wall-clock time, to line up with external monitor CSVs and screen recordings.
++	char       local_time[32] = "unknown";
++	const auto wall           = std::chrono::system_clock::now();
++	const auto wall_t         = std::chrono::system_clock::to_time_t(wall);
++	const auto wall_ms =
++	    std::chrono::duration_cast<std::chrono::milliseconds>(wall.time_since_epoch()).count() % 1000;
++	std::tm tm {};
++#ifdef _WIN32
++	const bool have_tm = localtime_s(&tm, &wall_t) == 0;
++#else
++	const bool have_tm = localtime_r(&wall_t, &tm) != nullptr;
++#endif
++	if (have_tm) {
++		char hms[24] = {};
++		std::strftime(hms, sizeof(hms), "%Y-%m-%d %H:%M:%S", &tm);
++		std::snprintf(local_time, sizeof(local_time), "%s.%03d", hms, static_cast<int>(wall_ms));
++	}
++
++	auto& master = m_command_scheduler.GetMasterSemaphore();
++	master.Refresh();
++	const uint64_t current      = master.CurrentTick();
++	const uint64_t done         = master.KnownGpuTick();
++	const uint64_t ticks_behind = current > done ? current - done - 1 : 0;
++
 +	if (!Common::DebugCounters::Enabled()) {
-+		static bool told = false;
-+		if (!told) {
-+			told = true;
-+			LOGF("Heartbeat: counters are off; start with --perf-overlay true (or press F2) to "
-+			     "log draws/submits/flips every 5 s\n");
-+		}
++		LOGF("Heartbeat(5s): local_time=%s uptime_s=%lld since_last_ms=%lld gpu_ticks_behind=%" PRIu64
++		     " (draw/submit/flip counts need \"Show performance panel\" or F2)\n",
++		     local_time, static_cast<long long>(uptime_s), static_cast<long long>(since_last_ms),
++		     ticks_behind);
 +		return;
 +	}
 +	static constexpr Counter Tracked[] = {
@@ -359,18 +394,14 @@ index 5ddb2c91..5d30fa38 100644
 +		delta[i]       = now - last[i];
 +		last[i]        = now;
 +	}
-+	auto& master = m_command_scheduler.GetMasterSemaphore();
-+	master.Refresh();
-+	const uint64_t current = master.CurrentTick();
-+	const uint64_t done    = master.KnownGpuTick();
-+	LOGF("Heartbeat(5s): submits=%" PRIu64 " draws=%" PRIu64 " dispatches=%" PRIu64
-+	     " flips_requested=%" PRIu64 " dropped_presents=%" PRIu64 " cpu_waits_on_gpu=%" PRIu64
-+	     " cpu_wait_on_gpu_ms=%" PRIu64 " pipelines_created=%" PRIu64 " pipeline_create_ms=%" PRIu64
-+	     " texture_evictions=%" PRIu64 " audio_underruns=%" PRIu64 " guest_file_read_kib=%" PRIu64
-+	     " gpu_ticks_behind=%" PRIu64 "\n",
-+	     delta[0], delta[1], delta[2], delta[3], delta[4], delta[5], delta[6] / 1000000,
-+	     delta[7], delta[8] / 1000000, delta[9], delta[10], delta[11] / 1024,
-+	     current > done ? current - done - 1 : 0);
++	LOGF("Heartbeat(5s): local_time=%s uptime_s=%lld since_last_ms=%lld submits=%" PRIu64
++	     " draws=%" PRIu64 " dispatches=%" PRIu64 " flips_requested=%" PRIu64
++	     " dropped_presents=%" PRIu64 " cpu_waits_on_gpu=%" PRIu64 " cpu_wait_on_gpu_ms=%" PRIu64
++	     " pipelines_created=%" PRIu64 " pipeline_create_ms=%" PRIu64 " texture_evictions=%" PRIu64
++	     " audio_underruns=%" PRIu64 " guest_file_read_kib=%" PRIu64 " gpu_ticks_behind=%" PRIu64 "\n",
++	     local_time, static_cast<long long>(uptime_s), static_cast<long long>(since_last_ms),
++	     delta[0], delta[1], delta[2], delta[3], delta[4], delta[5], delta[6] / 1000000, delta[7],
++	     delta[8] / 1000000, delta[9], delta[10], delta[11] / 1024, ticks_behind);
  }
  
  void RenderContext::RunGarbageCollector() {

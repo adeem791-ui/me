@@ -1,6 +1,6 @@
 # VRAM pressure relief for the Ghost of Yōtei out-of-memory crash (patch 17)
 
-**Status:** source change plus a GPU-free unit test. It was compiled for syntax only on Linux; the full Windows build happens in CI. **Not tested in the game.** Don't treat the crash as fixed until Ahmad has run the manual test below.
+**Status:** source change plus a GPU-free unit test. It compiles in the Windows CI build. **Not tested in the game.** Don't treat the crash as fixed until Ahmad has run the manual test below.
 
 Patch: `patches/17-vram-pressure-relief.patch`. It applies on upstream `9dcff95` after `patches/01-16-rebased-on-9dcff95.patch`.
 
@@ -69,9 +69,14 @@ VMA allocated 15,098,714,176   VMA blocks 15,399,548,928
    - The `vmaCreateImage failed` log now adds the format name, samples, tiling, usage, flags and the driver's required bytes, then the per-heap budget.
    - The EXIT message names the format.
    - `Device memory stats` (every 5 s) adds `committed=` and the relief counters.
-   - **`Heartbeat(5s)`** logs submits, draws, dispatches, flips, dropped presents, CPU waits on the GPU, pipelines created and their compile time, texture evictions, audio underruns, file reads, and how many GPU ticks are outstanding.
-     - It needs the performance panel: in the launcher's configuration, tick **"Show performance panel"**, or press F2 in game.
-     - It runs from the submission loop. If the log goes quiet for a long time, the GPU thread is blocked (usually a pipeline compile); look at the pipeline-timing lines next to the gap.
+   - **`Heartbeat(5s)`** logs every 5 s, always, with:
+     - `local_time` (your PC's clock, to the millisecond), `uptime_s`, and `since_last_ms`, the gap since the previous heartbeat;
+     - `gpu_ticks_behind`, the GPU work submitted but not yet finished.
+     - With **"Show performance panel"** ticked in the launcher's configuration, or F2 pressed in game, it also logs submits, draws, dispatches, flips, dropped presents, CPU waits on the GPU, pipelines created and their compile time, texture evictions, audio underruns and file reads.
+   - **The heartbeat stops if the loop it runs in stalls.** It is logged from the GPU submission loop, so if that loop is blocked (for example a long pipeline compile, or a GPU wait that never returns), the heartbeat lines stop.
+     - The **last heartbeat's `local_time`** is the last moment the loop was confirmed alive.
+     - The log can't tell you anything after that point. For that case, use **your external CPU/GPU monitor data and a screen capture**, lined up on that `local_time`.
+     - A `since_last_ms` much larger than 5000 on a later line means the loop stalled for that long and then recovered.
 6. **Switches.** Both are read once at startup and logged as `VRAM relief: enabled, headroom=… MiB`.
    - `KYTY_VRAM_RECOVERY=0` turns relief off.
    - `KYTY_VRAM_HEADROOM_MB` (256–4096, default 1024) sets the headroom.
@@ -88,7 +93,7 @@ Use the CI zip `KytyPS5-Yotei-VRAM-Relief-Experimental`, unzipped into a **new f
 1. In the launcher, open the Ghost of Yōtei configuration and tick **Show performance panel**.
 2. Run the same route that crashed before, for at least as long as it took to crash.
 3. Note whether it crashes, the time to crash, any visual problems (missing or blurry textures, flicker), and stutter.
-4. Run your CPU/GPU monitor script during the run.
+4. Run your CPU/GPU monitor script and a screen capture (for example the Xbox Game Bar recorder) for the whole run, with your PC clock visible or noted at the start. If the screen goes black, these are the only record after the last heartbeat.
 5. **A/B check:** run once with `START_WITHOUT_VRAM_RELIEF.cmd`, which sets `KYTY_VRAM_RECOVERY=0`. That should behave like the old build.
 6. Send `_kyty.txt` for both runs, plus the monitor CSVs and a screenshot or short clip of anything odd.
 
@@ -97,6 +102,7 @@ Use the CI zip `KytyPS5-Yotei-VRAM-Relief-Experimental`, unzipped into a **new f
 - `VRAM relief #N: committed_before=… evicted_images=… gpu_wait=1 committed_after=… released=…MiB took=…ms` means relief worked. Large `took` values mean visible hitches.
 - `(still above trigger: nothing more is safely evictable now)` means the cache had nothing left that was safe to drop. If a crash follows, the memory is somewhere this patch can't touch.
 - `vmaCreateImage failed: … format=… required_bytes=…` followed by the heap budget means it still ran out of memory. Send that log.
+- `Heartbeat(5s): local_time=…` every ~5 s. If they stop while the window is still open, note the last `local_time` and check the monitor CSV and recording from that time on.
 
 ## Rollback
 - **For a single run:** launch with `START_WITHOUT_VRAM_RELIEF.cmd`.
@@ -104,7 +110,8 @@ Use the CI zip `KytyPS5-Yotei-VRAM-Relief-Experimental`, unzipped into a **new f
 - **In source:** `git apply -R patches/17-vram-pressure-relief.patch`.
 
 ## Limitations
-- **Not run on a GPU.** The emulator code was only syntax-checked on Linux. Only the policy test actually ran: GCC with ASan/UBSan, and Clang. A deliberately wrong threshold makes it fail.
+- **Not run on a GPU.** The emulator compiles in Windows CI, but only the policy test has run: GCC with ASan/UBSan, and Clang. A deliberately wrong threshold makes it fail.
+- **The heartbeat can't report a stall of its own loop.** It goes silent instead; external monitoring and a screen capture cover that case.
 - **Relief can't free memory outside VMA** (the ~1.06 GB), or images that are in use or GPU-modified. If most of the 15 GB is in those, the crash can still happen. The new log lines will show that case.
 - **Each relief stalls the CPU until the GPU finishes**, so frequent relief can cause stutter. The per-attempt time is logged.
 - **Evicted textures are uploaded again** when used again, which costs bandwidth but not correctness.
