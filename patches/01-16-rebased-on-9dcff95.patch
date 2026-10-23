@@ -1,0 +1,1144 @@
+diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
+index 1cc557ef..79f5e6b8 100644
+--- a/src/graphics/guest_gpu/graphicsRun.cpp
++++ b/src/graphics/guest_gpu/graphicsRun.cpp
+@@ -24,6 +24,9 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
+ #include <cstdio>
+ #include <deque>
+ #include <memory>
+@@ -439,17 +442,76 @@ void GuestGpu::ThreadRun(void* data) {
+ 	g_gpu_thread = true;
+ 	g_gpu_state  = gpu;
+ 
++	// Optional single-thread queue diagnostics. Guest GPU PM4 commands cannot
++	// be safely spread over host threads just by setting CPU affinity. These
++	// counters measure whether the serialized processor is busy or waiting.
++	const char* profile_setting = std::getenv("KYTY_GPU_CPU_PROFILE");
++	const bool  profile = profile_setting != nullptr && std::strcmp(profile_setting, "1") == 0;
++	using ProfileClock = std::chrono::steady_clock;
++	auto          profile_start = ProfileClock::now();
++	uint64_t      busy_us = 0;
++	uint64_t      idle_wait_us = 0;
++	uint64_t      blocked_wait_us = 0;
++	uint64_t      graphics_us = 0;
++	uint64_t      compute_us = 0;
++	uint64_t      control_us = 0;
++	uint64_t      command_us = 0;
++	uint64_t      submissions = 0;
++	uint64_t      commands = 0;
++	uint64_t      incomplete_slices = 0;
++	uint64_t      blocked_poll_count = 0;
++	uint32_t      peak_queued_submissions = 0;
++	const auto profile_elapsed_us = [](ProfileClock::time_point start) -> uint64_t {
++		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
++		                                     ProfileClock::now() - start).count());
++	};
++	const auto profile_report = [&]() {
++		if (!profile) return;
++		const auto now = ProfileClock::now();
++		const auto window_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++		                           now - profile_start).count();
++		if (window_ms < 5000) return;
++		LOGF("GpuCpuProfile: interval_ms=%" PRId64 " busy_ms=%" PRIu64
++		     " graphics_ms=%" PRIu64 " compute_ms=%" PRIu64
++		     " control_ms=%" PRIu64 " command_ms=%" PRIu64
++		     " idle_wait_ms=%" PRIu64 " blocked_wait_ms=%" PRIu64
++		     " submissions=%" PRIu64 " commands=%" PRIu64
++		     " incomplete_slices=%" PRIu64 " blocked_polls=%" PRIu64
++		     " peak_queue=%u\n",
++		     static_cast<int64_t>(window_ms), busy_us / 1000, graphics_us / 1000,
++		     compute_us / 1000, control_us / 1000, command_us / 1000,
++		     idle_wait_us / 1000, blocked_wait_us / 1000,
++		     submissions, commands, incomplete_slices, blocked_poll_count,
++		     peak_queued_submissions);
++		profile_start = now;
++		busy_us = idle_wait_us = blocked_wait_us = 0;
++		graphics_us = compute_us = control_us = command_us = 0;
++		submissions = commands = incomplete_slices = blocked_poll_count = 0;
++		peak_queued_submissions = 0;
++	};
++	if (profile) {
++		LOGF("GpuCpuProfile: enabled host_logical_threads=%u serialized_pm4_workers=1 "
++		     "(counts are elapsed CPU-side queue times, not GPU execution times)\n",
++		     std::thread::hardware_concurrency());
++	}
++
+ 	for (;;) {
+ 		Submission                   submission;
+ 		Common::UniqueFunction<void> command;
+ 		bool                         has_submission = false;
+ 		bool                         should_stop    = false;
++		bool                         parked_blocked = false;
+ 		{
+ 			Common::LockGuard lock(gpu->m_queue_mutex);
+ 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+ 				gpu->m_processing = false;
+ 				gpu->m_idle.Signal();
++				const auto waited_since = profile ? ProfileClock::now() : ProfileClock::time_point {};
+ 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
++				if (profile) idle_wait_us += profile_elapsed_us(waited_since);
++			}
++			if (profile) {
++				peak_queued_submissions = std::max(peak_queued_submissions, gpu->m_submission_count);
+ 			}
+ 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+ 				gpu->m_processing = false;
+@@ -473,25 +535,38 @@ void GuestGpu::ThreadRun(void* data) {
+ 					gpu->m_processing = false;
+ 					// A wake that came before this wait must not be lost.
+ 					if (!std::exchange(gpu->m_wake_pending, false)) {
++						// WaitFor takes microseconds, and Windows rounds this 100 us
++						// poll to 1 ms. It is NOT a 100 ms frame delay.
++						const auto waited_since = profile ? ProfileClock::now() : ProfileClock::time_point {};
+ 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
++						if (profile) {
++							blocked_wait_us += profile_elapsed_us(waited_since);
++							blocked_poll_count++;
++						}
+ 					}
+ 					for (auto& queue: gpu->m_queues) {
+ 						if (!queue.empty()) {
+ 							queue.front().blocked = false;
+ 						}
+ 					}
+-					continue;
++					parked_blocked = true;
++				} else {
++					auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
++					submission  = std::move(queue.front());
++					queue.pop_front();
++					gpu->m_submission_count--;
++					gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
++					gpu->m_processing = true;
++					has_submission    = true;
+ 				}
+-				auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
+-				submission  = std::move(queue.front());
+-				queue.pop_front();
+-				gpu->m_submission_count--;
+-				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
+-				gpu->m_processing = true;
+-				has_submission    = true;
+ 			}
+ 		}
++		if (parked_blocked) {
++			profile_report();
++			continue;
++		}
+ 		if (should_stop) {
++			profile_report();
+ 			gpu->m_gfx_cp->BufferWait();
+ 			g_gpu_state  = nullptr;
+ 			g_gpu_thread = false;
+@@ -500,7 +575,15 @@ void GuestGpu::ThreadRun(void* data) {
+ 
+ 		if (command) {
+ 			EXIT_IF(g_current_processor != nullptr);
++			const auto work_start = profile ? ProfileClock::now() : ProfileClock::time_point {};
+ 			command();
++			if (profile) {
++				const uint64_t us = profile_elapsed_us(work_start);
++				busy_us += us;
++				command_us += us;
++				commands++;
++			}
++			profile_report();
+ 
+ 			Common::LockGuard lock(gpu->m_queue_mutex);
+ 			gpu->m_processing = false;
+@@ -511,7 +594,21 @@ void GuestGpu::ThreadRun(void* data) {
+ 		}
+ 
+ 		EXIT_IF(!has_submission);
++		const auto work_start = profile ? ProfileClock::now() : ProfileClock::time_point {};
+ 		const bool complete = gpu->Process(submission);
++		if (profile) {
++			const uint64_t us = profile_elapsed_us(work_start);
++			busy_us += us;
++			submissions++;
++			if (!complete) incomplete_slices++;
++			switch (submission.type) {
++				case SubmissionType::Graphics: graphics_us += us; break;
++				case SubmissionType::Compute: compute_us += us; break;
++				case SubmissionType::FlipPreparation:
++				case SubmissionType::SuspendPoint: control_us += us; break;
++			}
++		}
++		profile_report();
+ 
+ 		Common::LockGuard lock(gpu->m_queue_mutex);
+ 		if (!complete) {
+@@ -544,6 +641,41 @@ bool GuestGpu::Process(Submission& submission) {
+ 	}
+ 
+ 	cp.BufferInit();
++	// Frame/suspend-point GC may never run if the guest stops presenting while
++	// continuing to submit compute work. Check memory pressure at GPU submission
++	// boundaries, before allocations exhaust device-local VRAM. Every 8th submission
++	// normally; every submission once usage is at or over the budget, because the
++	// periodic check let usage pass the budget and reach ErrorOutOfDeviceMemory.
++	if (first_slice && submission.type != SubmissionType::SuspendPoint) {
++		auto& graphics = m_renderer.GetGraphics();
++		if (graphics.CanReportMemoryUsage()) {
++			constexpr uint64_t Headroom = 512ull * 1024 * 1024;
++			const auto budget = graphics.GetTotalMemoryBudget();
++			const auto usage = graphics.GetDeviceMemoryUsage();
++			const bool near_budget =
++			    budget != 0 && usage >= (budget > Headroom ? budget - Headroom : budget);
++			const bool over_budget = budget != 0 && usage >= budget;
++			if (near_budget && (over_budget || (m_submit_id & 7u) == 0)) {
++				static uint32_t pressure_logs = 0;
++				if (pressure_logs < 16 || (m_submit_id & 255u) == 0) {
++					pressure_logs++;
++					LOGF("GPU memory pressure: usage=%" PRIu64 " budget=%" PRIu64
++					     " over=%d submit=%" PRIu64 " - collecting idle caches\n",
++					     usage, budget, over_budget ? 1 : 0, m_submit_id);
++				}
++				m_renderer.RunGarbageCollector();
++			}
++		}
++	}
++	// Memory breakdown for leak hunting: a few counters, logged every 5 seconds.
++	if (first_slice) {
++		static std::chrono::steady_clock::time_point last_stats {};
++		const auto                                   now = std::chrono::steady_clock::now();
++		if (now - last_stats >= std::chrono::seconds(5)) {
++			last_stats = now;
++			m_renderer.LogMemoryStats();
++		}
++	}
+ 	bool complete = true;
+ 
+ 	switch (submission.type) {
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+index 91f30d77..4d294339 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+@@ -279,6 +279,16 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
+ 	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
+ }
+ 
++void BufferCache::LogMemoryStats() {
++	size_t             buffers = 0;
++	unsigned long long bytes   = 0;
++	m_slot_buffers.ForEach([&](BufferId, const Buffer& buffer) {
++		++buffers;
++		bytes += buffer.Size();
++	});
++	LOGF("BufferCache stats: buffers=%zu bytes=%llu\n", buffers, bytes);
++}
++
+ BufferCache::~BufferCache() {
+ 	if (!m_gpu_modified_ranges.Empty()) {
+ 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.h b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+index 8a30e68e..53186cd9 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.h
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.h
+@@ -90,6 +90,7 @@ public:
+ 		m_memory_tracker.QueueBdaSync(vaddr, size);
+ 	}
+ 	void               RunGarbageCollector();
++	void LogMemoryStats();
+ 
+ private:
+ 	friend struct BufferCacheTestAccess;
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.cpp b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+index 80b42d15..c2616b0e 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.cpp
+@@ -19,6 +19,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <chrono>
+ #include <bit>
+ #include <cinttypes>
+ #include <cstring>
+@@ -130,12 +131,22 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
+ 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
+ 		const auto        budget =
+ 		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
+-		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
+-		m_pressure_gc_memory = static_cast<uint64_t>(
+-		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
+-		m_critical_gc_memory = static_cast<uint64_t>(
+-		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
+-		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
++		// Measured on Yotei (RTX 5080): a single scene load can create >30k new images
++		// (~10 GB) within one 5-second window. An evicted image's VRAM is reclaimed only
++		// once the GPU catches up to the tick it was still in use at (see DeleteImage's
++		// DeferOperation), so eviction run mid-burst does not free memory immediately --
++		// it can only keep steady-state usage low enough beforehand to leave headroom for
++		// the next burst. The old thresholds left ~10% of budget as headroom once
++		// "critical" (aggressive eviction) engaged, which a multi-GB burst blows through
++		// before the periodic submission-boundary check (graphicsRun.cpp) can catch up.
++		// Start light eviction at 35% of budget, aggressive eviction at 65%, instead of
++		// ~79%/~89%, to leave roughly 3x the headroom.
++		m_trigger_gc_memory =
++		    static_cast<uint64_t>(std::max<int64_t>(budget * 35 / 100, GiB));
++		m_pressure_gc_memory =
++		    static_cast<uint64_t>(std::max<int64_t>(budget * 50 / 100, GiB + GiB / 2));
++		m_critical_gc_memory =
++		    static_cast<uint64_t>(std::max<int64_t>(budget * 65 / 100, 2 * GiB));
+ 	}
+ }
+ 
+@@ -201,8 +212,20 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
+ 	return image.usage.storage ? BindingType::Storage : BindingType::Texture;
+ }
+ 
++namespace {
++// Per-interval counters for the memory log. Written by the graphics thread; read and reset
++// in LogMemoryStats.
++uint64_t g_images_created       = 0;
++uint64_t g_images_created_bytes = 0;
++uint64_t g_uploads             = 0;
++uint64_t g_upload_bytes        = 0;
++uint64_t g_upload_us           = 0;
++} // namespace
++
+ ImageId TextureCache::InsertImage(const ImageInfo& info) {
+ 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
++	g_images_created++;
++	g_images_created_bytes += info.data.size;
+ 	RegisterImage(id);
+ 	return id;
+ }
+@@ -1204,7 +1227,14 @@ void TextureCache::RefreshImage(ImageId id) {
+ 	if (!cpu_dirty) {
+ 		return;
+ 	}
++	const uint64_t bytes = image.info.data.size;
++	const auto     start = std::chrono::steady_clock::now();
+ 	InitializeImage(id);
++	g_uploads++;
++	g_upload_bytes += bytes;
++	g_upload_us += static_cast<uint64_t>(
++	    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start)
++	        .count());
+ }
+ 
+ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
+@@ -1367,6 +1397,45 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+ 	return result;
+ }
+ 
++ImageId TextureCache::FindStandaloneImage(ImageDesc& desc) {
++	auto& command = m_scheduler.Current();
++	if (command.IsInvalid()) {
++		EXIT("TextureCache: image lookup requires a valid command buffer\n");
++	}
++	ValidateImageDesc(desc);
++	EXIT_IF(desc.info.data.Empty());
++	const auto metadata_base_layer = desc.view_info.base_layer;
++
++	ImageId result {};
++	{
++		std::scoped_lock lock {m_lock};
++		const auto       candidates =
++		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
++		// Reuse only an image with the exact same guest layout. No view, slice or expansion of
++		// another image is made, because the base is not a block boundary of that image.
++		for (const auto id: candidates) {
++			const auto& image = m_slot_images[id];
++			if (!image.depth_id && SameBacking(image.info, desc.info, false)) {
++				result = id;
++				break;
++			}
++		}
++		if (!result) {
++			result         = InsertImage(desc.info);
++			auto& inserted = m_slot_images[result];
++			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
++			                                    inserted.info.data.size)) {
++				inserted.MarkBufferModified();
++			}
++		}
++		auto& image              = m_slot_images[result];
++		image.tick_accessed_last = m_scheduler.CurrentTick();
++		TouchImage(image);
++	}
++	MaterializeColorClear(result, desc, metadata_base_layer);
++	return result;
++}
++
+ void TextureCache::UpdateImage(ImageId id) {
+ 	std::scoped_lock lock {m_lock};
+ 	auto&            image = m_slot_images[id];
+@@ -1997,11 +2066,20 @@ void TextureCache::RunGarbageCollector() {
+ 	if (m_total_used_memory < m_trigger_gc_memory) {
+ 		return;
+ 	}
+-	const auto collect = [&](bool allow_aggressive) {
++	// On a VRAM emergency the normal 160-tick retention window can keep too
++	// many dead textures resident until vmaCreateImage fails. Deferred image
++	// destruction still waits for the Vulkan scheduler; modified textures are
++	// protected by the existing readback rules below.
++	const bool emergency = m_graphics.CanReportMemoryUsage() &&
++	                       m_total_used_memory >= m_graphics.GetTotalMemoryBudget();
++	size_t         freed_images = 0;
++	const uint64_t usage_before = m_total_used_memory;
++	const auto     collect       = [&](bool allow_aggressive) {
+ 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
+ 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
+-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
+-		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
++		const uint64_t age = std::min<uint64_t>(
++		    emergency && aggressive ? 8 : aggressive ? 160 : pressured ? 80 : 16, tick);
++		size_t deletions = emergency && aggressive ? 160 : aggressive ? 40 : pressured ? 20 : 10;
+ 		std::vector<ImageId> candidates;
+ 		candidates.reserve(deletions);
+ 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
+@@ -2037,6 +2115,7 @@ void TextureCache::RunGarbageCollector() {
+ 				}
+ 			}
+ 			FreeImage(id);
++			++freed_images;
+ 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
+ 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
+ 				deletions >>= 2;
+@@ -2052,6 +2131,48 @@ void TextureCache::RunGarbageCollector() {
+ 	if (m_total_used_memory >= m_critical_gc_memory) {
+ 		collect(true);
+ 	}
++	// Emergency diagnostics: shows whether collection frees anything. Freed images are
++	// destroyed through the scheduler, so VMA usage can lag behind this count.
++	if (emergency && (tick % 16) == 0) {
++		LOGF("TextureCache emergency GC: tick=%" PRIu64 " freed_images=%zu usage_before=%" PRIu64
++		     " usage_after=%" PRIu64 "\n",
++		     tick, freed_images, usage_before, m_total_used_memory);
++	}
++}
++
++void TextureCache::LogMemoryStats() {
++	std::scoped_lock lock {m_lock};
++	size_t           images    = 0;
++	size_t           modified  = 0;
++	uint64_t         accounted = 0;
++	std::vector<std::pair<uint64_t, uint32_t>> surfaces;
++	m_slot_images.ForEach([&](ImageId, const Image& image) {
++		if (!image.registered) {
++			return;
++		}
++		++images;
++		accounted += image.AccountedSize();
++		if (image.IsGpuModified()) {
++			++modified;
++		}
++		surfaces.emplace_back(image.info.data.address,
++		                      static_cast<uint32_t>(image.info.pixel_format));
++	});
++	std::sort(surfaces.begin(), surfaces.end());
++	const auto distinct =
++	    static_cast<size_t>(std::unique(surfaces.begin(), surfaces.end()) - surfaces.begin());
++	// Images that share a guest address and format are duplicates of one surface.
++	LOGF("TextureCache stats: images=%zu accounted=%" PRIu64 " gpu_modified=%zu "
++	     "same_surface_duplicates=%zu\n",
++	     images, accounted, modified, images - distinct);
++	LOGF("TextureCache interval: created=%" PRIu64 " created_bytes=%" PRIu64 " uploads=%" PRIu64 " "
++	     "upload_bytes=%" PRIu64 " upload_ms=%" PRIu64 "\n",
++	     g_images_created, g_images_created_bytes, g_uploads, g_upload_bytes, g_upload_us / 1000);
++	g_images_created = 0;
++	g_images_created_bytes = 0;
++	g_uploads = 0;
++	g_upload_bytes = 0;
++	g_upload_us = 0;
+ }
+ 
+ void TextureCache::ProcessDownloadImages() {
+diff --git a/src/graphics/host_gpu/renderer/cache/textureCache.h b/src/graphics/host_gpu/renderer/cache/textureCache.h
+index 9050421e..f1402d54 100644
+--- a/src/graphics/host_gpu/renderer/cache/textureCache.h
++++ b/src/graphics/host_gpu/renderer/cache/textureCache.h
+@@ -51,6 +51,8 @@ public:
+ 	KYTY_CLASS_NO_COPY(TextureCache);
+ 
+ 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
++	// Image for a tiled base that is not 64 KB aligned: never a view of another image.
++	[[nodiscard]] ImageId       FindStandaloneImage(ImageDesc& desc);
+ 	void                        UpdateImage(ImageId id);
+ 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
+ 	                                               bool ensure_valid = true);
+@@ -78,6 +80,7 @@ public:
+ 	void UnmapMemory(uint64_t address, uint64_t size);
+ 	void ProcessDownloadImages();
+ 	void RunGarbageCollector();
++	void LogMemoryStats();
+ 
+ private:
+ 	struct MetaDataInfo {
+diff --git a/src/graphics/host_gpu/renderer/commandScheduler.cpp b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+index 4ae2b36c..117007dd 100644
+--- a/src/graphics/host_gpu/renderer/commandScheduler.cpp
++++ b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+@@ -260,6 +260,11 @@ bool CommandScheduler::HasPendingPriorityOperations() {
+ 	return !m_priority_operations.empty() || m_priority_active;
+ }
+ 
++size_t CommandScheduler::PendingOperationCount() {
++	std::lock_guard lock(m_operation_mutex);
++	return m_pending_operations.size() + m_priority_operations.size();
++}
++
+ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+ 	while (!stop.stop_requested()) {
+ 		PendingOperation operation;
+diff --git a/src/graphics/host_gpu/renderer/commandScheduler.h b/src/graphics/host_gpu/renderer/commandScheduler.h
+index 6e418850..0abc99e7 100644
+--- a/src/graphics/host_gpu/renderer/commandScheduler.h
++++ b/src/graphics/host_gpu/renderer/commandScheduler.h
+@@ -41,6 +41,7 @@ public:
+ 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
+ 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+ 	[[nodiscard]] bool        HasPendingPriorityOperations();
++	[[nodiscard]] size_t        PendingOperationCount();
+ 	[[nodiscard]] static bool InDeferredOperation() noexcept;
+ 
+ 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
+diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+index 3a3f0abc..1c1a24a5 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+@@ -583,8 +583,29 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
+ 		desc.info.UpdateSize();
+ 	}
+ 	const auto alignment = desc.info.DataAlignment();
+-	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
+-	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
++	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0);
++	// A tiled base that is only 256-byte aligned cannot be a mip or layer slice of an emulator
++	// image, so it gets its own image instead of stopping the emulator.
++	const bool standalone = (address & (static_cast<uint64_t>(alignment) - 1u)) != 0;
++	if (standalone) {
++		static uint32_t standalone_logs = 0;
++		if (standalone_logs < 16 || (standalone_logs & 255u) == 0) {
++			LOGF("Standalone texture image (base not aligned to %u): addr=0x%016llx size=0x%llx "
++			     "tiled=%d tile=%u format=%u type=%u extent=%ux%ux%u levels=%u layers=%u "
++			     "block_bytes=%u base_level=%u last_level=%u\n",
++			     alignment, static_cast<unsigned long long>(address),
++			     static_cast<unsigned long long>(desc.info.data.size), desc.info.IsTiled() ? 1 : 0,
++			     static_cast<uint32_t>(tile), static_cast<uint32_t>(format),
++			     static_cast<uint32_t>(type), static_cast<unsigned>(desc.info.extent.width),
++			     static_cast<unsigned>(desc.info.extent.height),
++			     static_cast<unsigned>(desc.info.extent.depth),
++			     static_cast<unsigned>(desc.info.resources.levels),
++			     static_cast<unsigned>(desc.info.resources.layers),
++			     static_cast<unsigned>(desc.info.bytes_per_block), static_cast<unsigned>(base_level),
++			     static_cast<unsigned>(last_level));
++		}
++		standalone_logs++;
++	}
+ 	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
+ 	if (resource.heap && !m_context.IsMapped(address, desc.info.data.size)) {
+ 		return {.layout = vk::ImageLayout::eGeneral};
+@@ -605,7 +626,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
+ 	desc.view_info.base_level = view_base;
+ 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+ 
+-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
++	auto       id                  = standalone ? texture_cache.FindStandaloneImage(desc)
++	                          : texture_cache.FindImage(desc, shader_conversion);
+ 	auto*      image               = &texture_cache.GetImage(id);
+ 	const bool stencil_association = static_cast<bool>(image->depth_id);
+ 	if (stencil_association) {
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+index fd2e331b..ef005630 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
+@@ -14,6 +14,7 @@
+ #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+ #include "graphics/host_gpu/renderer/image/imageView.h"
+ #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
++#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+ #include "graphics/host_gpu/renderer/render.h"
+ #include "graphics/host_gpu/renderer/renderContext.h"
+ #include "graphics/shader/recompiler/ShaderRecompiler.h"
+@@ -26,8 +27,12 @@
+ #include <atomic>
+ #include <cctype>
+ #include <chrono>
++#include <bit>
++#include <filesystem>
++#include <fstream>
+ #include <cstdio>
+ #include <cstring>
++#include <cstdlib>
+ #include <fmt/format.h>
+ #include <limits>
+ #include <span>
+@@ -43,6 +48,30 @@ namespace {
+ 
+ constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
+ 
++// Compute recordings contain locally translated SPIR-V + the *actual* Vulkan
++// pipeline recipe. They are only written with explicit user opt-in. In
++// particular, no guest pointers, shader source archive or personal paths are
++// sent anywhere. Recordings are for the same GPU/driver and versioned format.
++std::string PipelineCacheTitleId();
++
++bool RecordComputeEnabled() {
++    const char* value = std::getenv("KYTY_RECORD_COMPUTE");
++    return value != nullptr && std::strcmp(value, "1") == 0;
++}
++
++std::filesystem::path ComputeRecordingDirectory() {
++    std::string title = PipelineCacheTitleId();
++    if (title.empty()) return {};
++    std::filesystem::path root("_PipelineCache");
++    if (const char* override_path = std::getenv("KYTY_PIPELINE_CACHE_DIR");
++        override_path != nullptr && *override_path != 0) {
++        std::filesystem::path candidate(override_path);
++        if (candidate.is_absolute()) root = std::move(candidate);
++    }
++    return root / "compute_recordings" / title;
++}
++
++
+ uint8_t RemapSourceAlphaFactor(uint8_t factor) {
+ 	switch (static_cast<Prospero::BlendFactor>(factor)) {
+ 		case Prospero::BlendFactor::kSrcAlpha:
+@@ -253,8 +282,12 @@ struct PipelineCache::ProgramCache {
+ 		template <bool HasCalls>
+ 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
+ 		                             uint32_t push_data_cursor) {
+-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+-			    resource_plan, runtime, resources, specialization));
++			materialization_failed = false;
++			if (!ShaderRecompiler::IR::MaterializeResources(
++			        resource_plan, runtime, resources, specialization)) {
++				materialization_failed = true;
++				return nullptr;
++			}
+ 			for (auto& candidate: permutations) {
+ 				const auto& layout = candidate.program.bindings;
+ 				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
+@@ -276,6 +309,7 @@ struct PipelineCache::ProgramCache {
+ 		ShaderRecompiler::IR::ResourceSpecialization specialization;
+ 		std::vector<Permutation>                    permutations;
+ 		bool                                       skip_dispatch = false;
++		bool                                       materialization_failed = false;
+ 	};
+ 
+ 	struct ProgramKeyHash {
+@@ -315,17 +349,38 @@ struct PipelineCache::ProgramCache {
+ 		}
+ 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+ 
++		std::filesystem::path recorded_spv;
++		if (RecordComputeEnabled() && options.stage == ShaderType::Compute &&
++		    !result.spirv.empty() && result.spirv.size() <= 4'194'304) {
++			auto directory = ComputeRecordingDirectory();
++			std::error_code error;
++			if (!directory.empty()) std::filesystem::create_directories(directory, error);
++			if (!error && !directory.empty()) {
++				const auto content_hash = XXH3_64bits(result.spirv.data(), result.spirv.size() * 4);
++				recorded_spv = directory / fmt::format("{:016x}.spv", content_hash);
++				if (!std::filesystem::exists(recorded_spv, error)) {
++					std::ofstream out(recorded_spv, std::ios::binary | std::ios::trunc);
++					out.write(reinterpret_cast<const char*>(result.spirv.data()),
++					          static_cast<std::streamsize>(result.spirv.size() * 4));
++					}
++			}
++		}
++
+ 		const auto module = CompileSPV(result.spirv, graphics.device);
+ 		EXIT_IF(module == nullptr);
+ 		if (options.dump_ir) {
+ 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
+ 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
+ 		}
++		const uint64_t shader_id = ++next_shader_id;
++		if (!recorded_spv.empty()) recorded_spirv_by_id.emplace(shader_id, std::move(recorded_spv));
+ 		return {
+ 		    .function_code  = {function_code.begin(), function_code.end()},
+ 		    .specialization = std::move(specialization),
+ 		    .program        = std::move(result.program).TakeCompiledInfo(),
+-		    .handle         = {.id = ++next_shader_id, .module = module},
++		    .handle         = {.id = shader_id, .module = module,
++		                       .shader_hash = options.shader_hash,
++		                       .spirv_words = static_cast<uint32_t>(result.spirv.size())},
+ 		};
+ 	}
+ 
+@@ -343,6 +398,22 @@ struct PipelineCache::ProgramCache {
+ 		}
+ 
+ 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
++		// Diagnostic only: allow users to verify that the known Yotei compute pipeline
++		// is the render-thread blocker. Missing this dispatch can break rendering;
++		// never enable it by default or silently for other shaders.
++		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
++			const char* skip = std::getenv("KYTY_DIAGNOSTIC_SKIP_YOTEI_CS");
++			if (params.hash == 0xbe2f5f42f6b7c531ULL && skip != nullptr &&
++			    std::strcmp(skip, "1") == 0) {
++				static bool warned = false;
++				if (!warned) {
++					warned = true;
++					PipelineCacheLog("Yotei diagnostic: skipping CS 0xbe2f5f42f6b7c531; "
++					                 "visuals may be incorrect. Do not use for normal gameplay.");
++				}
++				return {};
++			}
++		}
+ 		lookup_key.stage           = stage;
+ 		lookup_key.hash            = params.hash;
+ 		lookup_key.user_data_count = params.user_data_count;
+@@ -370,6 +441,14 @@ struct PipelineCache::ProgramCache {
+ 			} else {
+ 				permutation = cached.FindPermutation<false>(runtime, push_data_cursor);
+ 			}
++			if (cached.materialization_failed) {
++				static uint32_t logged_failures = 0;
++				if (logged_failures++ < 32) {
++					PipelineCacheLog("Shader resource materialization failed; skipping stage {} hash 0x{:016x}",
++					                 static_cast<uint32_t>(stage), params.hash);
++				}
++				return {};
++			}
+ 			if (permutation != nullptr) {
+ 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
+ 				permutation->program.bindings.AdvancePushData(push_data_cursor);
+@@ -447,9 +526,16 @@ struct PipelineCache::ProgramCache {
+ 			auto retained = !source.calls.empty() ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
+ 			entry = programs.try_emplace(lookup_key,
+ 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
+-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+-			    entry->second.resource_plan, runtime, entry->second.resources,
+-			    entry->second.specialization));
++			if (!ShaderRecompiler::IR::MaterializeResources(
++			        entry->second.resource_plan, runtime, entry->second.resources,
++			        entry->second.specialization)) {
++				static uint32_t logged_first_use = 0;
++				if (logged_first_use++ < 32) {
++					PipelineCacheLog("Shader resource materialization failed on first use; skipping stage {} hash 0x{:016x}",
++					                 static_cast<uint32_t>(stage), params.hash);
++				}
++				return {};
++			}
+ 		} else if (source_changed) {
+ 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+ 			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {
+@@ -499,6 +585,7 @@ struct PipelineCache::ProgramCache {
+ 		}
+ 	}
+ 
++	std::unordered_map<uint64_t, std::filesystem::path> recorded_spirv_by_id;
+ 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+ 	ProgramKey                                                  lookup_key;
+ 	GraphicContext&                                             graphics;
+@@ -541,7 +628,16 @@ void PipelineCache::InitializeDriverCache() {
+ 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
+ 		return;
+ 	}
+-	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
++	m_driver_cache_path = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
++	// Optional shared driver cache across successive portable ZIP extractions.
++	// The file's existing driver UUID/version and checksum validation still applies.
++	// This stores only Vulkan driver cache data, not proprietary guest shader inputs.
++	if (const char* root = std::getenv("KYTY_PIPELINE_CACHE_DIR"); root != nullptr && root[0] != 0) {
++		const std::filesystem::path directory(root);
++		if (directory.is_absolute()) {
++			m_driver_cache_path = directory / (title_id + ".bin");
++		}
++	}
+ 	const auto path         = Common::PathToString(m_driver_cache_path);
+ 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
+ 	if (cache_exists) {
+@@ -818,9 +914,14 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
+ 	GraphicsPrograms  result;
+ 	if (pixel_active) {
+ 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
++		if (!result.pixel) return result;
+ 	}
+ 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
+ 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
++		if (!result.vertex[i]) {
++			result.vertex[0] = {};
++			return result;
++		}
+ 	}
+ 	return result;
+ }
+@@ -1069,13 +1170,62 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
+ 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
+ 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
+ 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+-		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
+-		                       m_driver_cache);
++		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program, m_driver_cache);
+ 	}
+ 
+ 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+ 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+ 
++	// Captures only pipelines that have successfully compiled during this run.
++	// Record format KCS1: 8 u32 header words, N * 3 u32 descriptor entries,
++	// followed by exact SPIR-V u32 words. No dynamic addresses are serialized.
++	if (RecordComputeEnabled()) {
++		auto location = m_program_cache->recorded_spirv_by_id.find(compute_program.id);
++		if (location != m_program_cache->recorded_spirv_by_id.end()) {
++			std::ifstream spv_file(location->second, std::ios::binary | std::ios::ate);
++			const auto file_size = spv_file ? spv_file.tellg() : std::streampos(-1);
++			if (file_size >= std::streampos(20) && file_size <= std::streampos(16 * 1024 * 1024) &&
++			    (static_cast<uint64_t>(file_size) % 4) == 0) {
++				std::vector<uint32_t> spv(static_cast<size_t>(file_size) / 4);
++				spv_file.seekg(0);
++				spv_file.read(reinterpret_cast<char*>(spv.data()), static_cast<std::streamsize>(file_size));
++				if (spv_file && spv[0] == 0x07230203) {
++					const auto& program = *input_info.stage.program;
++					uint32_t flags = program.info.uses_gds ? 1u : 0u;
++					if (cached->uses_push_descriptors) flags |= 2u;
++					const char* fast = std::getenv("KYTY_LARGE_CS_FAST_COMPILE");
++					if (spv.size() >= 262'144 && !(fast && std::strcmp(fast, "0") == 0)) flags |= 4u;
++					const uint32_t wave_size = program.wave_size;
++					const auto required = m_graphics.compute_subgroup_size_control_enabled &&
++					    wave_size >= m_graphics.min_subgroup_size &&
++					    wave_size <= m_graphics.max_subgroup_size ? wave_size : 0u;
++					std::vector<uint32_t> record = {
++					    0x3153434bu, 1u, static_cast<uint32_t>(spv.size()), wave_size,
++					    required, flags, 0u, ShaderRecompiler::IR::NativePushConstantSize};
++					for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
++						const auto i = std::countr_zero(mask);
++						const auto kind = static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(i);
++						record.insert(record.end(), {
++						    ShaderRecompiler::IR::NativeBinding(program.stage, kind),
++						    static_cast<uint32_t>(NativeDescriptorType(kind)),
++						    program.bindings.descriptor_counts[i]});
++						record[6]++;
++					}
++					record.insert(record.end(), spv.begin(), spv.end());
++					const uint64_t digest = XXH3_64bits(record.data(), record.size() * 4);
++					const auto destination = location->second.parent_path() /
++					    fmt::format("{:016x}.kcs", digest);
++					std::error_code error;
++					if (!std::filesystem::exists(destination, error)) {
++						std::ofstream output(destination, std::ios::binary | std::ios::trunc);
++						output.write(reinterpret_cast<const char*>(record.data()),
++						             static_cast<std::streamsize>(record.size() * 4));
++					}
++				}
++			}
++		}
++	}
++
+ 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
+ 	EXIT_IF(!inserted);
+ 	CheckpointDriverCache();
+diff --git a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
+index f49f8820..5630483e 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
++++ b/src/graphics/host_gpu/renderer/pipeline/pipelineCache.h
+@@ -101,6 +101,8 @@ struct PipelineVertexInputState {
+ struct ShaderProgram {
+ 	uint64_t         id     = 0;
+ 	vk::ShaderModule module = nullptr;
++	uint64_t         shader_hash = 0;
++	uint32_t         spirv_words = 0;
+ 
+ 	explicit operator bool() const { return id != 0 && module != nullptr; }
+ };
+@@ -201,7 +203,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
+                             vk::PipelineCache                      driver_cache);
+ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                             const ShaderComputeInputInfo& input_info,
+-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
++                            const ShaderProgram& compute_program, vk::PipelineCache driver_cache);
+ 
+ } // namespace Libs::Graphics
+ 
+diff --git a/src/graphics/host_gpu/renderer/pipeline/shaders.cpp b/src/graphics/host_gpu/renderer/pipeline/shaders.cpp
+index 9a2863bc..307cf016 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/shaders.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/shaders.cpp
+@@ -21,6 +21,9 @@
+ #include <algorithm>
+ #include <array>
+ #include <bit>
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
+ #include <limits>
+ #include <span>
+ #include <vector>
+@@ -599,13 +602,13 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
+ // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                             const ShaderComputeInputInfo& input_info,
+-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache) {
+-	EXIT_IF(compute_module == nullptr);
++                            const ShaderProgram& compute_program, vk::PipelineCache driver_cache) {
++	EXIT_IF(!compute_program);
+ 
+ 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
+ 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
+ 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
+-	comp_shader_stage_info.module = compute_module;
++	comp_shader_stage_info.module = compute_program.module;
+ 	comp_shader_stage_info.pName  = "main";
+ 	EXIT_IF(!input_info.stage);
+ 	const auto wave_size = input_info.stage.program->wave_size;
+@@ -650,14 +653,67 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
+ 	info.layout            = pipeline.pipeline_layout;
+ 	info.basePipelineIndex = -1;
+ 
++	// Measured on the Yotei title screen (RTX 5080): across 585 compute pipeline
++	// compiles in one 5-minute session, 36 took over a second; the two worst (a
++	// 467k-word shader) took 26-28s EACH, and a recompiled 86k-word shader alone
++	// added 21 compiles averaging 1.5s. DISABLE_OPTIMIZATION is a Vulkan core
++	// *hint*, not a timeout; it keeps shader semantics intact but can trade
++	// runtime performance for a much shorter driver compilation path. It was
++	// previously gated to shaders >= 262144 SPIR-V words, which missed the 86k
++	// and 211k-word shaders above -- most of the measured stall time. Apply it
++	// to every compute pipeline; KYTY_LARGE_CS_FAST_COMPILE=0 restores the old
++	// behaviour (full optimization, slower compiles) for A/B comparison.
++	const char* fast_compile_env = std::getenv("KYTY_LARGE_CS_FAST_COMPILE");
++	const bool fast_compile = fast_compile_env == nullptr ||
++	                          std::strcmp(fast_compile_env, "0") != 0;
++	if (fast_compile) {
++		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
++	}
++
+ 	EXIT_IF(pipeline.pipeline != nullptr);
+ 
+-	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
+-	     static_cast<void*>(pipeline.pipeline_layout));
++	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p shader=0x%016" PRIx64
++	     " spirv_words=%u disable_optimization=%u\n",
++	     static_cast<void*>(pipeline.pipeline_layout), compute_program.shader_hash,
++	     compute_program.spirv_words, fast_compile ? 1u : 0u);
++	// Ask the driver to report whether driver_cache saved most of the work (core in Vulkan 1.3, which
++	// the emulator requires). It only reports; creation is unchanged. A loaded cache does not
++	// guarantee hits, so this is how to check a prewarm. KYTY_PIPELINE_FEEDBACK=0 turns it off.
++	const char* feedback_env = std::getenv("KYTY_PIPELINE_FEEDBACK");
++	const bool  feedback_enabled = feedback_env == nullptr || std::strcmp(feedback_env, "0") != 0;
++	vk::PipelineCreationFeedback           pipeline_feedback {};
++	vk::PipelineCreationFeedback           stage_feedback {};
++	vk::PipelineCreationFeedbackCreateInfo feedback_info {};
++	feedback_info.pPipelineCreationFeedback          = &pipeline_feedback;
++	feedback_info.pipelineStageCreationFeedbackCount = 1;
++	feedback_info.pPipelineStageCreationFeedbacks    = &stage_feedback;
++	if (feedback_enabled) {
++		feedback_info.pNext = info.pNext;
++		info.pNext          = &feedback_info;
++	}
++	const auto pipeline_start = std::chrono::steady_clock::now();
+ 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
+ 	                                                &pipeline.pipeline);
+-	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
+-	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
++	const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++	    std::chrono::steady_clock::now() - pipeline_start).count();
++	// cache_feedback=hit: the driver set APPLICATION_PIPELINE_CACHE_HIT, i.e. it reports that
++	// driver_cache let it avoid most of the creation work. no_hit_reported: the bit was clear,
++	// which does NOT prove a miss; the driver may still have reused part of the cache.
++	// unavailable: feedback disabled or not marked valid by the driver.
++	const char* cache_feedback = "unavailable";
++	long        driver_ms      = -1;
++	if (feedback_enabled &&
++	    (pipeline_feedback.flags & vk::PipelineCreationFeedbackFlagBits::eValid)) {
++		cache_feedback = (pipeline_feedback.flags &
++		                  vk::PipelineCreationFeedbackFlagBits::eApplicationPipelineCacheHit)
++		                     ? "hit"
++		                     : "no_hit_reported";
++		driver_ms = static_cast<long>(pipeline_feedback.duration / 1'000'000u);
++	}
++	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p shader=0x%016" PRIx64
++	     " elapsed_ms=%" PRId64 " cache_feedback=%s driver_ms=%ld\n",
++	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline),
++	     compute_program.shader_hash, static_cast<int64_t>(elapsed_ms), cache_feedback, driver_ms);
+ 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+ 
+ 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+diff --git a/src/graphics/host_gpu/renderer/renderContext.cpp b/src/graphics/host_gpu/renderer/renderContext.cpp
+index 2cb9e75b..5ddb2c91 100644
+--- a/src/graphics/host_gpu/renderer/renderContext.cpp
++++ b/src/graphics/host_gpu/renderer/renderContext.cpp
+@@ -138,6 +138,15 @@ void RenderContext::PrepareBda() {
+ 	m_fault_process_pending = true;
+ }
+ 
++void RenderContext::LogMemoryStats() {
++	m_texture_cache.LogMemoryStats();
++	m_buffer_cache.LogMemoryStats();
++	LOGF("Scheduler stats: pending_operations=%zu\n", m_command_scheduler.PendingOperationCount());
++	LOGF("Device memory stats: usage=%llu budget=%llu\n",
++	     static_cast<unsigned long long>(GetGraphics().GetDeviceMemoryUsage()),
++	     static_cast<unsigned long long>(GetGraphics().GetTotalMemoryBudget()));
++}
++
+ void RenderContext::RunGarbageCollector() {
+ 	if (m_fault_process_pending) {
+ 		m_fault_process_pending = false;
+diff --git a/src/graphics/host_gpu/renderer/renderContext.h b/src/graphics/host_gpu/renderer/renderContext.h
+index 665e4516..1a8b38e5 100644
+--- a/src/graphics/host_gpu/renderer/renderContext.h
++++ b/src/graphics/host_gpu/renderer/renderContext.h
+@@ -57,6 +57,7 @@ public:
+ 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+ 	void               PrepareBda();
+ 	void               RunGarbageCollector();
++	void LogMemoryStats();
+ 
+ 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
+ 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
+diff --git a/src/graphics/host_gpu/renderer/renderDraw.cpp b/src/graphics/host_gpu/renderer/renderDraw.cpp
+index 6f980aee..717b9728 100644
+--- a/src/graphics/host_gpu/renderer/renderDraw.cpp
++++ b/src/graphics/host_gpu/renderer/renderDraw.cpp
+@@ -911,6 +911,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
+ 	                  (color_output_mask != 0 ||
+ 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
+ 	RefreshShaders(buffer, draw, color_output_mask, state);
++	// An SRT pointer may be temporarily invalid while guest resources are changing.
++	// Do not dereference an absent compiled shader or terminate the game for one draw.
++	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) return false;
+ 	uint32_t mrt_mask = 0;
+ 	if (state.ps_active) {
+ 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
+diff --git a/src/graphics/host_gpu/vma.cpp b/src/graphics/host_gpu/vma.cpp
+index 944066ff..937995aa 100644
+--- a/src/graphics/host_gpu/vma.cpp
++++ b/src/graphics/host_gpu/vma.cpp
+@@ -159,6 +159,10 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
+ 	                   &alloc_info, &native_image, &image.allocation, nullptr));
+ 	image.image = native_image;
+ 	if (result != vk::Result::eSuccess) {
++		LOGF("vmaCreateImage failed: result=%s extent=%ux%ux%u format=%u layers=%u levels=%u\n",
++		     vk::to_string(result).c_str(), image_info.extent.width, image_info.extent.height,
++		     image_info.extent.depth, static_cast<uint32_t>(image_info.format),
++		     image_info.arrayLayers, image_info.mipLevels);
+ 		LogMemoryBudget();
+ 		return false;
+ 	}
+diff --git a/src/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp b/src/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp
+index 5c688867..16dfbd59 100644
+--- a/src/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp
++++ b/src/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp
+@@ -822,45 +822,69 @@ private:
+ 		           ? native->src0.reg : UINT32_MAX;
+ 	}
+ 
++	// Use an explicit DFS work stack. Deep, acyclic SSA dependency chains can contain
++	// thousands of values; recursive traversal would exhaust the default 1 MiB
++	// Windows thread stack before the existing Phi cycle detection gets involved.
+ 	void CollectScalarRead(Value value, uint32_t use_pc) {
+-		value = value.Resolve();
+-		if (value.IsImmediate()) return;
+-		auto* inst = value.TryInstruction();
+-		if (inst == nullptr) Fail(use_pc, "invalid typed planning value");
+-		const auto cycle = std::ranges::find(m_srt_visiting, inst);
+-		if (cycle != m_srt_visiting.end()) {
+-			if (std::any_of(cycle, m_srt_visiting.end(), [](const Inst* value) {
+-				return value->GetOpcode() == ValueOpcode::Phi;
+-			})) return;
+-			Fail(use_pc, "cyclic typed planning value without a phi");
+-		}
+-		if (std::ranges::find(m_srt_visited, inst) != m_srt_visited.end()) return;
+-		m_srt_visiting.push_back(inst);
+-		uint32_t memory_index = 0;
+-		const auto* memory = ScalarReadMemory(*inst, memory_index);
+-		DescriptorSource source;
+-		if (memory != nullptr) {
+-			const auto* handle = inst->Arg(0).Resolve().TryInstruction();
+-			const auto width = memory->kind == ResourceKind::ScalarBuffer ? 4u : 2u;
+-			if (handle == nullptr || handle->GetOpcode() !=
+-			        (width == 4u ? ValueOpcode::GetBufferResource : ValueOpcode::GetAddressResource))
+-				Fail(use_pc, "scalar read has an invalid resource handle");
+-			MakeSource(*handle, width, false, false, ScalarReadBase(*inst), source,
+-			           inst->Flags<MemoryFlags>().pc);
+-			for (uint32_t word = 0; word < width; ++word)
+-				CollectScalarRead(source.dwords[word], inst->Flags<MemoryFlags>().pc);
+-			for (size_t arg = 1; arg < inst->NumArgs(); ++arg)
+-				CollectScalarRead(inst->Arg(arg), use_pc);
+-		} else {
+-			for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
+-				CollectScalarRead(inst->Arg(arg), use_pc);
+-		}
+-		m_srt_visiting.pop_back();
+-		m_srt_visited.push_back(inst);
+-		if (memory == nullptr) return;
+-		const auto offset = inst->Arg(1).Resolve();
+-		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return;
+-		m_scalar_reads.push_back(inst);
++		struct Frame {
++			Value    value;
++			uint32_t use_pc;
++			Inst*    leaving = nullptr;
++			bool     scalar_read = false;
++		};
++		std::vector<Frame> work;
++		work.push_back({value, use_pc});
++		while (!work.empty()) {
++			const auto frame = work.back();
++			work.pop_back();
++			if (frame.leaving != nullptr) {
++				// Post-order: mirror the work done after all recursive child calls.
++				m_srt_visiting.pop_back();
++				m_srt_visited.push_back(frame.leaving);
++				if (frame.scalar_read) {
++					const auto offset = frame.leaving->Arg(1).Resolve();
++					if (offset.IsImmediate() && offset.GetType() == Type::U32)
++						m_scalar_reads.push_back(frame.leaving);
++				}
++				continue;
++			}
++
++			const auto resolved = frame.value.Resolve();
++			if (resolved.IsImmediate()) continue;
++			auto* inst = resolved.TryInstruction();
++			if (inst == nullptr) Fail(frame.use_pc, "invalid typed planning value");
++			const auto cycle = std::ranges::find(m_srt_visiting, inst);
++			if (cycle != m_srt_visiting.end()) {
++				if (std::any_of(cycle, m_srt_visiting.end(), [](const Inst* value) {
++					return value->GetOpcode() == ValueOpcode::Phi;
++				})) continue;
++				Fail(frame.use_pc, "cyclic typed planning value without a phi");
++			}
++			if (std::ranges::find(m_srt_visited, inst) != m_srt_visited.end()) continue;
++			m_srt_visiting.push_back(inst);
++
++			uint32_t memory_index = 0;
++			const auto* memory = ScalarReadMemory(*inst, memory_index);
++			work.push_back({{}, frame.use_pc, inst, memory != nullptr});
++			if (memory != nullptr) {
++				const auto* handle = inst->Arg(0).Resolve().TryInstruction();
++				const auto width = memory->kind == ResourceKind::ScalarBuffer ? 4u : 2u;
++				if (handle == nullptr || handle->GetOpcode() !=
++				        (width == 4u ? ValueOpcode::GetBufferResource : ValueOpcode::GetAddressResource))
++					Fail(frame.use_pc, "scalar read has an invalid resource handle");
++				DescriptorSource source;
++				MakeSource(*handle, width, false, false, ScalarReadBase(*inst), source,
++				           inst->Flags<MemoryFlags>().pc);
++				// LIFO: enqueue children in reverse order to retain recursive DFS order.
++				for (size_t arg = inst->NumArgs(); arg-- > 1;)
++					work.push_back({inst->Arg(arg), frame.use_pc});
++				for (uint32_t word = width; word-- > 0;)
++					work.push_back({source.dwords[word], inst->Flags<MemoryFlags>().pc});
++			} else {
++				for (size_t arg = inst->NumArgs(); arg-- > 0;)
++					work.push_back({inst->Arg(arg), frame.use_pc});
++			}
++		}
+ 	}
+ 
+ 	void PlanScalarReads() {
+diff --git a/src/kernel/pthread.cpp b/src/kernel/pthread.cpp
+index 75dfdf9c..958d8a34 100644
+--- a/src/kernel/pthread.cpp
++++ b/src/kernel/pthread.cpp
+@@ -3226,6 +3226,8 @@ static void* RunThread(void* arg) {
+ 	os_thread_id = GetHostThreadId();
+ #endif
+ 	thread->host_thread_id = os_thread_id;
++	LOGF("Thread start: name=%s host_tid=%llu guest_id=%d\n", thread->name.c_str(),
++	     static_cast<unsigned long long>(os_thread_id), thread->unique_id);
+ #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+ 	if (!thread->name.empty()) {
+ #if defined(__APPLE__)

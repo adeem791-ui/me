@@ -43,28 +43,15 @@ jobs:
       - name: Retrieve pinned Kyty source and Vulkan headers
         run: |
           git clone --filter=blob:none https://github.com/KytyPS5/KytyPS5.git source
-          git -C source checkout 7b7f9a7
+          git -C source checkout 9dcff95e809ec43ba66f56648164070f4b16348f
           git -C source submodule update --init --depth 1 3rdparty/Vulkan-Headers
 
-      - name: Apply patch stack in build order
+      - name: Apply the consolidated patch
         run: |
-          patches="CollectScalarRead-stack-overflow 02-large-compute-fast-compile 03-vram-pressure-gc"
-          patches="$patches 04-materialization-recovery 05-shared-driver-cache"
-          patches="$patches 06-record-known-compute-pipelines 07-gpu-cpu-profile"
-          patches="$patches 08-compute-pipeline-cache-feedback"
-          patches="$patches 09-vram-emergency-gc"
-          patches="$patches 10-vram-leak-diagnostics"
-          patches="$patches 11-texture-descriptor-diagnostics"
-          patches="$patches 12-standalone-texture-images"
-          patches="$patches 13-texture-churn-and-upload-timing"
-          patches="$patches 14-thread-os-id-log"
-          patches="$patches 15-fast-compile-all-compute"
-          patches="$patches 16-earlier-vram-headroom"
-          for p in $patches; do
-            git -C source apply --check "$GITHUB_WORKSPACE/patches/$p.patch" || { echo "::error::$p does not apply"; exit 1; }
-            git -C source apply "$GITHUB_WORKSPACE/patches/$p.patch"
-            echo "applied $p"
-          done
+          patch="$GITHUB_WORKSPACE/patches/01-16-rebased-on-9dcff95.patch"
+          git -C source apply --check "$patch" || { echo "::error::consolidated patch does not apply"; exit 1; }
+          git -C source apply "$patch"
+          echo "applied 01-16-rebased-on-9dcff95.patch"
 
       - name: Device-profile self-test
         run: |
@@ -89,154 +76,19 @@ jobs:
           git config --global core.longpaths true
           git clone https://github.com/KytyPS5/KytyPS5.git source
           if ($LASTEXITCODE -ne 0) { throw "Upstream clone failed" }
-          git -C source checkout 7b7f9a7
+          git -C source checkout 9dcff95e809ec43ba66f56648164070f4b16348f
           if ($LASTEXITCODE -ne 0) { throw "Pinned commit not available" }
           git -C source submodule update --init --recursive
           if ($LASTEXITCODE -ne 0) { throw "Failed to retrieve submodules" }
 
-      - name: Apply experimental stack-overflow fix
+      - name: Apply the consolidated patch
         shell: pwsh
         run: |
-          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/CollectScalarRead-stack-overflow.patch'
+          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/01-16-rebased-on-9dcff95.patch'
           git -C source apply --check $patch
-          if ($LASTEXITCODE -ne 0) { throw "Patch validation failed" }
+          if ($LASTEXITCODE -ne 0) { throw "Consolidated patch validation failed" }
           git -C source apply $patch
-          if ($LASTEXITCODE -ne 0) { throw "Patch application failed" }
-
-      - name: Apply large compute shader compile workaround
-        shell: pwsh
-        run: |
-          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/02-large-compute-fast-compile.patch'
-          git -C source apply --check $patch
-          if ($LASTEXITCODE -ne 0) { throw "Compute patch validation failed" }
-          git -C source apply $patch
-          if ($LASTEXITCODE -ne 0) { throw "Compute patch application failed" }
-
-      - name: Apply VRAM-pressure texture-cache cleanup
-        shell: pwsh
-        run: |
-          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/03-vram-pressure-gc.patch'
-          git -C source apply --check $patch
-          if ($LASTEXITCODE -ne 0) { throw "VRAM-pressure patch validation failed" }
-          git -C source apply $patch
-          if ($LASTEXITCODE -ne 0) { throw "VRAM-pressure patch application failed" }
-
-      - name: Apply transient shader resource recovery
-        shell: pwsh
-        run: |
-          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/04-materialization-recovery.patch'
-          git -C source apply --check $patch
-          if ($LASTEXITCODE -ne 0) { throw "Materialization patch validation failed" }
-          git -C source apply $patch
-          if ($LASTEXITCODE -ne 0) { throw "Materialization patch application failed" }
-
-      - name: Enable optional shared Vulkan pipeline cache
-        shell: pwsh
-        run: |
-          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/05-shared-driver-cache.patch'
-          git -C source apply --check $patch
-          if ($LASTEXITCODE -ne 0) { throw "Shared cache patch validation failed" }
-          git -C source apply $patch
-          if ($LASTEXITCODE -ne 0) { throw "Shared cache patch application failed" }
-
-      - name: Apply opt-in compute shader recording
-        shell: pwsh
-        run: |
-          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/06-record-known-compute-pipelines.patch'
-          git -C source apply --check $patch
-          if ($LASTEXITCODE -ne 0) { throw "Compute recorder patch validation failed" }
-          git -C source apply $patch
-          if ($LASTEXITCODE -ne 0) { throw "Compute recorder patch application failed" }
-
-      - name: Apply optional GPU CPU queue profiler
-        shell: pwsh
-        run: |
-          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/07-gpu-cpu-profile.patch'
-          git -C source apply --check $patch
-          if ($LASTEXITCODE -ne 0) { throw "GPU CPU profiler patch validation failed" }
-          git -C source apply $patch
-          if ($LASTEXITCODE -ne 0) { throw "GPU CPU profiler patch application failed" }
-
-      - name: Apply compute pipeline cache-hit feedback logging
-        shell: pwsh
-        run: |
-          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/08-compute-pipeline-cache-feedback.patch'
-          git -C source apply --check $patch
-          if ($LASTEXITCODE -ne 0) { throw "Cache feedback patch validation failed" }
-          git -C source apply $patch
-          if ($LASTEXITCODE -ne 0) { throw "Cache feedback patch application failed" }
-
-      - name: Apply VRAM emergency collection and diagnostics
-        shell: pwsh
-        run: |
-          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/09-vram-emergency-gc.patch'
-          git -C source apply --check $patch
-          if ($LASTEXITCODE -ne 0) { throw "VRAM emergency patch validation failed" }
-          git -C source apply $patch
-          if ($LASTEXITCODE -ne 0) { throw "VRAM emergency patch application failed" }
-
-      - name: Apply VRAM leak diagnostics
-        shell: pwsh
-        run: |
-          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/10-vram-leak-diagnostics.patch'
-          git -C source apply --check $patch
-          if ($LASTEXITCODE -ne 0) { throw "VRAM diagnostics patch validation failed" }
-          git -C source apply $patch
-          if ($LASTEXITCODE -ne 0) { throw "VRAM diagnostics patch application failed" }
-
-      - name: Apply texture descriptor diagnostics
-        shell: pwsh
-        run: |
-          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/11-texture-descriptor-diagnostics.patch'
-          git -C source apply --check $patch
-          if ($LASTEXITCODE -ne 0) { throw "Texture diagnostics patch validation failed" }
-          git -C source apply $patch
-          if ($LASTEXITCODE -ne 0) { throw "Texture diagnostics patch application failed" }
-
-      - name: Apply standalone texture images for unaligned tiled bases
-        shell: pwsh
-        run: |
-          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/12-standalone-texture-images.patch'
-          git -C source apply --check $patch
-          if ($LASTEXITCODE -ne 0) { throw "Standalone texture patch validation failed" }
-          git -C source apply $patch
-          if ($LASTEXITCODE -ne 0) { throw "Standalone texture patch application failed" }
-
-      - name: Apply texture churn and upload timing diagnostics
-        shell: pwsh
-        run: |
-          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/13-texture-churn-and-upload-timing.patch'
-          git -C source apply --check $patch
-          if ($LASTEXITCODE -ne 0) { throw "Texture churn patch validation failed" }
-          git -C source apply $patch
-          if ($LASTEXITCODE -ne 0) { throw "Texture churn patch application failed" }
-
-      - name: Apply thread OS ID logging
-        shell: pwsh
-        run: |
-          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/14-thread-os-id-log.patch'
-          git -C source apply --check $patch
-          if ($LASTEXITCODE -ne 0) { throw "Thread ID logging patch validation failed" }
-          git -C source apply $patch
-          if ($LASTEXITCODE -ne 0) { throw "Thread ID logging patch application failed" }
-
-      - name: Apply fast-compile for all compute pipelines
-        shell: pwsh
-        run: |
-          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/15-fast-compile-all-compute.patch'
-          git -C source apply --check $patch
-          if ($LASTEXITCODE -ne 0) { throw "Fast-compile patch validation failed" }
-          git -C source apply $patch
-          if ($LASTEXITCODE -ne 0) { throw "Fast-compile patch application failed" }
-
-      - name: Apply earlier VRAM headroom thresholds
-        shell: pwsh
-        run: |
-          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/16-earlier-vram-headroom.patch'
-          git -C source apply --check $patch
-          if ($LASTEXITCODE -ne 0) { throw "VRAM headroom patch validation failed" }
-          git -C source apply $patch
-          if ($LASTEXITCODE -ne 0) { throw "VRAM headroom patch application failed" }
+          if ($LASTEXITCODE -ne 0) { throw "Consolidated patch application failed" }
 
       - name: Locate vcpkg
         id: vcpkg
@@ -320,25 +172,10 @@ jobs:
             if (!(Test-Path (Join-Path $dest $name))) { throw "Runtime DLL missing: $name" }
           }
           Copy-Item 'source/LICENSE' (Join-Path $dest 'LICENSE_KytyPS5.txt')
-          Copy-Item 'patches/CollectScalarRead-stack-overflow.patch' (Join-Path $dest 'CollectScalarRead-stack-overflow.patch')
-          Copy-Item 'patches/02-large-compute-fast-compile.patch' (Join-Path $dest '02-large-compute-fast-compile.patch')
-          Copy-Item 'patches/03-vram-pressure-gc.patch' (Join-Path $dest '03-vram-pressure-gc.patch')
-          Copy-Item 'patches/04-materialization-recovery.patch' (Join-Path $dest '04-materialization-recovery.patch')
-          Copy-Item 'patches/05-shared-driver-cache.patch' (Join-Path $dest '05-shared-driver-cache.patch')
+          Copy-Item 'patches/01-16-rebased-on-9dcff95.patch' (Join-Path $dest '01-16-rebased-on-9dcff95.patch')
           Copy-Item 'scripts/START_SHARED_SHADER_CACHE.cmd' (Join-Path $dest 'START_SHARED_SHADER_CACHE.cmd')
-          Copy-Item 'patches/06-record-known-compute-pipelines.patch' (Join-Path $dest '06-record-known-compute-pipelines.patch')
           Copy-Item 'scripts/RECORD_COMPUTE_SHADERS.cmd' (Join-Path $dest 'RECORD_COMPUTE_SHADERS.cmd')
           Copy-Item 'scripts/PRECOMPILE_KNOWN_COMPUTE.cmd' (Join-Path $dest 'PRECOMPILE_KNOWN_COMPUTE.cmd')
-          Copy-Item 'patches/07-gpu-cpu-profile.patch' (Join-Path $dest '07-gpu-cpu-profile.patch')
-          Copy-Item 'patches/08-compute-pipeline-cache-feedback.patch' (Join-Path $dest '08-compute-pipeline-cache-feedback.patch')
-          Copy-Item 'patches/09-vram-emergency-gc.patch' (Join-Path $dest '09-vram-emergency-gc.patch')
-          Copy-Item 'patches/10-vram-leak-diagnostics.patch' (Join-Path $dest '10-vram-leak-diagnostics.patch')
-          Copy-Item 'patches/11-texture-descriptor-diagnostics.patch' (Join-Path $dest '11-texture-descriptor-diagnostics.patch')
-          Copy-Item 'patches/12-standalone-texture-images.patch' (Join-Path $dest '12-standalone-texture-images.patch')
-          Copy-Item 'patches/13-texture-churn-and-upload-timing.patch' (Join-Path $dest '13-texture-churn-and-upload-timing.patch')
-          Copy-Item 'patches/14-thread-os-id-log.patch' (Join-Path $dest '14-thread-os-id-log.patch')
-          Copy-Item 'patches/15-fast-compile-all-compute.patch' (Join-Path $dest '15-fast-compile-all-compute.patch')
-          Copy-Item 'patches/16-earlier-vram-headroom.patch' (Join-Path $dest '16-earlier-vram-headroom.patch')
           Copy-Item 'scripts/START_GPU_CPU_PROFILE.cmd' (Join-Path $dest 'START_GPU_CPU_PROFILE.cmd')
           Copy-Item 'scripts/PROFILE_CPU_THREADS.cmd' (Join-Path $dest 'PROFILE_CPU_THREADS.cmd')
           Copy-Item 'scripts/PROFILE_CPU_THREADS.ps1' (Join-Path $dest 'PROFILE_CPU_THREADS.ps1')
@@ -355,7 +192,9 @@ jobs:
           start "" "%~dp0kyty_launcher.exe"
           '@ | Set-Content (Join-Path $dest 'TEST_DIAGNOSTIC_SKIP_CS.cmd') -Encoding ascii
           @'
-          Experimental unofficial KytyPS5 Windows build based on source at 7b7f9a7.
+          Experimental unofficial KytyPS5 Windows build based on upstream source at 9dcff95 (2026-10-23),
+          76 commits ahead of the earlier 7b7f9a7 pin, including upstream fixes to GPU-driven indirect
+          draws, image-heap texture residency, and a GPU-thread flip-wait stall.
           Open kyty_launcher.exe after unzipping; keep all runtime DLLs and assets together.
           Requires Windows x64 and Vulkan-capable graphics drivers.
           No development software should be required to run the finished package.
