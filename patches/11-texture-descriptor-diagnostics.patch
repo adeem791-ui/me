@@ -1,0 +1,28 @@
+diff --git a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+index aa7870f..4958615 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+@@ -577,6 +577,23 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
+ 		desc.info.UpdateSize();
+ 	}
+ 	const auto alignment = desc.info.DataAlignment();
++	if (desc.info.data.size == 0 || alignment == 0 ||
++	    (address & (static_cast<uint64_t>(alignment) - 1u)) != 0) {
++		// Log the texture that is about to stop the emulator, so the next crash log names it.
++		LOGF("Texture descriptor rejected: addr=0x%016llx size=0x%llx alignment=%u tiled=%d "
++		     "tile=%u format=%u type=%u extent=%ux%ux%u levels=%u layers=%u block_bytes=%u "
++		     "base_level=%u last_level=%u\n",
++		     static_cast<unsigned long long>(address),
++		     static_cast<unsigned long long>(desc.info.data.size), alignment,
++		     desc.info.IsTiled() ? 1 : 0, static_cast<uint32_t>(tile), static_cast<uint32_t>(format),
++		     static_cast<uint32_t>(type), static_cast<unsigned>(desc.info.extent.width),
++		     static_cast<unsigned>(desc.info.extent.height),
++		     static_cast<unsigned>(desc.info.extent.depth),
++		     static_cast<unsigned>(desc.info.resources.levels),
++		     static_cast<unsigned>(desc.info.resources.layers),
++		     static_cast<unsigned>(desc.info.bytes_per_block), static_cast<unsigned>(base_level),
++		     static_cast<unsigned>(last_level));
++	}
+ 	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
+ 	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
+ 	if (storage) {
