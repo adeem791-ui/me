@@ -1,0 +1,782 @@
+diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
+index 79f5e6b8..f927f6e5 100644
+--- a/src/graphics/guest_gpu/graphicsRun.cpp
++++ b/src/graphics/guest_gpu/graphicsRun.cpp
+@@ -11,6 +11,7 @@
+ #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
+ #include "graphics/guest_gpu/hardwareContext.h"
+ #include "graphics/guest_gpu/pm4.h"
++#include "graphics/host_gpu/renderer/frameProgress.h"
+ #include "graphics/host_gpu/renderer/render.h"
+ #include "graphics/host_gpu/renderer/renderContext.h"
+ #include "graphics/host_gpu/renderer/sync.h"
+@@ -255,6 +256,7 @@ void CommandProcessor::ResetDeCe() {
+ 
+ void CommandProcessor::WaitCe() {
+ 	if (m_ce_count <= m_de_count && !m_ce_complete) {
++		FrameProgress::NoteSuspend(FrameProgress::Reason::WaitCe);
+ 		SuspendPm4();
+ 	}
+ }
+@@ -262,12 +264,14 @@ void CommandProcessor::WaitCe() {
+ void CommandProcessor::WaitDeDiff(uint32_t diff) {
+ 	EXIT_IF(m_de_count > m_ce_count);
+ 	if (m_ce_count - m_de_count >= diff) {
++		FrameProgress::NoteSuspend(FrameProgress::Reason::WaitDe);
+ 		SuspendPm4();
+ 	}
+ }
+ 
+ void CommandProcessor::WaitForRewind(bool valid) {
+ 	if (!valid) {
++		FrameProgress::NoteSuspend(FrameProgress::Reason::Rewind);
+ 		SuspendPm4();
+ 	}
+ }
+@@ -313,6 +317,10 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
+ 
+ 	(void)poll;
+ 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
++		// arg0/arg1: the low half of the watched address, and the value seen there now.
++		FrameProgress::NoteSuspend(FrameProgress::Reason::WaitRegMem,
++		                           static_cast<uint32_t>(reinterpret_cast<uintptr_t>(addr)),
++		                           static_cast<uint32_t>(*addr));
+ 		SuspendPm4();
+ 	}
+ }
+@@ -445,6 +453,8 @@ void GuestGpu::ThreadRun(void* data) {
+ 	// Optional single-thread queue diagnostics. Guest GPU PM4 commands cannot
+ 	// be safely spread over host threads just by setting CPU affinity. These
+ 	// counters measure whether the serialized processor is busy or waiting.
++	// Runs on its own thread, so a stall here cannot silence it; joined on every exit path.
++	FrameProgress::ScopedTrace frame_trace;
+ 	const char* profile_setting = std::getenv("KYTY_GPU_CPU_PROFILE");
+ 	const bool  profile = profile_setting != nullptr && std::strcmp(profile_setting, "1") == 0;
+ 	using ProfileClock = std::chrono::steady_clock;
+@@ -611,11 +621,14 @@ void GuestGpu::ThreadRun(void* data) {
+ 		profile_report();
+ 
+ 		Common::LockGuard lock(gpu->m_queue_mutex);
++		const auto frame_trace_queue = submission.queue_id;
+ 		if (!complete) {
++			FrameProgress::NoteRequeue(frame_trace_queue);
+ 			submission.blocked = true;
+ 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
+ 			gpu->m_submission_count++;
+ 		} else {
++			FrameProgress::NoteComplete(frame_trace_queue);
+ 			for (auto& queue: gpu->m_queues) {
+ 				if (!queue.empty()) {
+ 					queue.front().blocked = false;
+@@ -636,6 +649,7 @@ bool GuestGpu::Process(Submission& submission) {
+ 	if (first_slice) {
+ 		submission.started = true;
+ 		cp.SetSubmitId(++m_submit_id);
++		FrameProgress::NoteSubmissionStart(submission.queue_id, m_submit_id);
+ 		cp.ResetDeCe();
+ 		cp.SetFlip({});
+ 	}
+@@ -943,6 +957,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t
+ 				const auto end   = results[db * 2u + 1u];
+ 				if ((begin & end & ready_bit) == 0) {
+ 					if (wait_op == 0) {
++						FrameProgress::NoteSuspend(FrameProgress::Reason::Occlusion);
+ 						SuspendPm4();
+ 					} else {
+ 						m_predicate_skip = false;
+@@ -976,6 +991,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t
+ }
+ 
+ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
++	FrameProgress::NoteDecodedIndexed();
+ 	args.index_type_and_size = m_index_type_and_size;
+ 	if (args.instance_count == 0) {
+ 		args.instance_count = NumInstances();
+@@ -1032,9 +1048,13 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
+ 	                     stride_in_bytes < (indexed ? sizeof(vk::DrawIndexedIndirectCommand)
+ 	                                                : sizeof(vk::DrawIndirectCommand)));
+ 
+-	const auto draw_count = count_addr == nullptr
+-	                            ? max_count_or_count
+-	                            : std::min(uint32_t {*count_addr}, max_count_or_count);
++	const uint32_t count_from_memory = count_addr == nullptr ? 0 : uint32_t {*count_addr};
++	const auto     draw_count =
++	    count_addr == nullptr ? max_count_or_count
++	                              : std::min(count_from_memory, max_count_or_count);
++	FrameProgress::NoteIndirectCount(count_addr != nullptr, count_from_memory, max_count_or_count,
++	                                 m_draw_indirect_args_base_addr + data_offset, indexed,
++	                                 m_submit_id);
+ 	if (draw_count == 0) {
+ 		return;
+ 	}
+@@ -1133,6 +1153,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
+ }
+ 
+ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
++	FrameProgress::NoteDecodedDirect();
+ 	if (args.instance_count == 0) {
+ 		args.instance_count = NumInstances();
+ 	}
+@@ -1143,6 +1164,8 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
+ 	// Stall only this command processor, not the host command lane or other queues.
+ 	if (!m_renderer.GetVideoOut().IsSafeForRendering(static_cast<int>(video_out_handle),
+ 	                                                 static_cast<int>(display_buffer_index))) {
++		FrameProgress::NoteSuspend(FrameProgress::Reason::FlipWait, video_out_handle,
++		                           display_buffer_index);
+ 		SuspendPm4();
+ 	}
+ }
+diff --git a/src/graphics/host_gpu/renderer/commandScheduler.cpp b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+index 117007dd..8a70a714 100644
+--- a/src/graphics/host_gpu/renderer/commandScheduler.cpp
++++ b/src/graphics/host_gpu/renderer/commandScheduler.cpp
+@@ -4,6 +4,7 @@
+ #include "common/debugCounters.h"
+ #include "common/logging/log.h"
+ #include "graphics/host_gpu/graphicContext.h"
++#include "graphics/host_gpu/renderer/frameProgress.h"
+ 
+ #include <algorithm>
+ #include <cstdio>
+@@ -380,6 +381,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+ 		result = graphics.queue.submit(1, &submit_info, nullptr);
+ 	}
+ 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
++	FrameProgress::NoteQueueSubmit();
+ 
+ 	if (result != vk::Result::eSuccess) {
+ 		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
+diff --git a/src/graphics/host_gpu/renderer/frameProgress.h b/src/graphics/host_gpu/renderer/frameProgress.h
+new file mode 100644
+index 00000000..1a497ab9
+--- /dev/null
++++ b/src/graphics/host_gpu/renderer/frameProgress.h
+@@ -0,0 +1,545 @@
++#ifndef GRAPHICS_HOST_GPU_RENDERER_FRAME_PROGRESS_H_
++#define GRAPHICS_HOST_GPU_RENDERER_FRAME_PROGRESS_H_
++
++// Where frame production stops, reported from a thread of its own.
++//
++// Why a separate thread: the report must stay readable while the GPU thread is stuck. The
++// watchdog only reads lock-free counters and never waits on the GPU thread, so a stall shows up
++// as counters that stop advancing while the line keeps coming. A gap in the output is therefore
++// the watchdog's own gap, not a concealed stall.
++//
++// Diagnostic only. Nothing here changes rendering: no draw is skipped, no result substituted, no
++// error hidden. It keeps its own counters rather than switching on the performance overlay's
++// global ones, so the overlay's semantics are untouched.
++//
++// KYTY_FRAME_TRACE=0 turns ALL of it off: the watchdog, every counter and every detail line.
++// Each Note* function then returns before touching any state.
++
++#include "common/logging/log.h"
++
++#include <vulkan/vulkan_core.h>
++
++#include <atomic>
++#include <chrono>
++#include <cinttypes>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <mutex>
++#include <thread>
++
++namespace Libs::Graphics::FrameProgress {
++
++// Why a command processor last stopped mid-submission. Logged, so keep the values stable.
++enum class Reason : int {
++	None        = 0,
++	FlipWait    = 1, // WaitFlipDone: the display buffer is still displayed or still queued
++	WaitRegMem  = 2, // WAIT_REG_MEM: a value in guest memory has not reached the reference yet
++	WaitCe      = 3, // the constant engine has not caught up
++	WaitDe      = 4, // the draw engine is too far behind the constant engine
++	Rewind      = 5, // REWIND packet not yet valid
++	Occlusion   = 6, // occlusion counters not yet marked ready
++	Other       = 7, // any other SuspendPm4 site
++};
++
++inline const char* ReasonName(int reason) {
++	switch (static_cast<Reason>(reason)) {
++		case Reason::None: return "none";
++		case Reason::FlipWait: return "flip_wait";
++		case Reason::WaitRegMem: return "wait_reg_mem";
++		case Reason::WaitCe: return "wait_ce";
++		case Reason::WaitDe: return "wait_de";
++		case Reason::Rewind: return "rewind";
++		case Reason::Occlusion: return "occlusion";
++		case Reason::Other: return "other";
++	}
++	return "unknown";
++}
++
++// Stall state is per queue, so a completion on one queue cannot clear another's stall.
++// GuestGpu::QueueCount is 1 + the compute queues; this is an upper bound, and a larger queue id
++// is folded into the last slot rather than writing out of range.
++inline constexpr uint32_t MaxQueues = 64;
++
++// Total FrameTrace lines one run may emit, so the log cannot grow without limit. At one line
++// per 5 s this is about 5.7 hours, after which the watchdog says so once and stops.
++inline constexpr uint64_t MaxTraceLines = 4096;
++
++// Per-site detail lines, logged for the first few occurrences only.
++inline constexpr uint64_t MaxDetailLines = 8;
++
++namespace Detail {
++
++struct Counter {
++	std::atomic<uint64_t> value {0};
++	void                  Add(uint64_t amount = 1) { value.fetch_add(amount, std::memory_order_relaxed); }
++	[[nodiscard]] uint64_t Get() const { return value.load(std::memory_order_relaxed); }
++};
++
++// Draw packets as decoded from the guest command stream.
++inline Counter g_decoded_direct;
++inline Counter g_decoded_indexed;
++inline Counter g_decoded_indirect_packets;
++inline Counter g_decoded_indirect_draws;
++// Indirect packets whose count read as zero. Zero can be legitimate (see NoteIndirectCount).
++inline Counter g_indirect_count_zero;
++// Draws that reached a host command buffer. decoded > recorded means they are lost in between.
++inline Counter g_recorded_draws;
++// Graphics pipelines: attempts, and how they ended. An attempt with no outcome means the thread
++// is still inside the driver call.
++inline Counter g_gfx_pipeline_attempts;
++inline Counter g_gfx_pipeline_success;
++inline Counter g_gfx_pipeline_failed;
++// Submission and presentation.
++inline Counter g_submits;
++inline Counter g_flips_requested;
++inline Counter g_presents_ok;         // VK_SUCCESS
++inline Counter g_presents_suboptimal; // VK_SUBOPTIMAL_KHR: presented, swapchain to be recreated
++inline Counter g_presents_failed;     // anything else: nothing presented
++// Command-processor suspends, submission requeues and completions.
++inline Counter g_suspends;
++inline Counter g_requeues;
++inline Counter g_completions;
++
++inline Counter g_detail_lines;
++
++struct QueueStall {
++	std::atomic<uint64_t> since_us {0}; // steady clock us of the first requeue in this run, 0 = clear
++	// Id of the submission this queue's processor is running, set when that submission starts.
++	// A queue is strictly head-of-line, so while a submission is stalled at its front no later
++	// one from the same queue can start: this id is the stalled submission's own.
++	std::atomic<uint64_t> current_submit_id {0};
++	std::atomic<uint64_t> submit_id {0};
++	std::atomic<uint64_t> requeues {0};
++	std::atomic<int>      reason {static_cast<int>(Reason::None)};
++	std::atomic<uint32_t> arg0 {0};
++	std::atomic<uint32_t> arg1 {0};
++};
++
++inline QueueStall g_queues[MaxQueues];
++
++// Set by the command processor when it suspends, read by the requeue that follows it on the same
++// thread. Thread-local, so two queue threads cannot cross their reasons.
++struct PendingSuspend {
++	Reason   reason = Reason::None;
++	uint32_t arg0   = 0;
++	uint32_t arg1   = 0;
++};
++
++inline thread_local PendingSuspend t_pending;
++
++// -1 = not read yet, 0 = off, 1 = on. Read from KYTY_FRAME_TRACE once, on first use.
++inline std::atomic<int> g_enabled {-1};
++
++// Tests only: forces the switch without touching the environment.
++inline void SetEnabledForTest(bool enabled) { g_enabled.store(enabled ? 1 : 0, std::memory_order_relaxed); }
++
++inline uint64_t NowUs() {
++	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
++	                                 std::chrono::steady_clock::now().time_since_epoch())
++	                                 .count());
++}
++
++inline uint32_t Slot(uint32_t queue_id) { return queue_id < MaxQueues ? queue_id : MaxQueues - 1; }
++
++inline void LocalTime(char* out, size_t size) {
++	std::snprintf(out, size, "unknown");
++	const auto wall   = std::chrono::system_clock::now();
++	const auto wall_t = std::chrono::system_clock::to_time_t(wall);
++	const auto wall_ms =
++	    std::chrono::duration_cast<std::chrono::milliseconds>(wall.time_since_epoch()).count() %
++	    1000;
++	std::tm tm {};
++#ifdef _WIN32
++	if (localtime_s(&tm, &wall_t) != 0) {
++		return;
++	}
++#else
++	if (localtime_r(&wall_t, &tm) == nullptr) {
++		return;
++	}
++#endif
++	char hms[24] = {};
++	std::strftime(hms, sizeof(hms), "%Y-%m-%d %H:%M:%S", &tm);
++	std::snprintf(out, size, "%s.%03d", hms, static_cast<int>(wall_ms));
++}
++
++} // namespace Detail
++
++[[nodiscard]] inline bool Enabled() {
++	int state = Detail::g_enabled.load(std::memory_order_relaxed);
++	if (state < 0) {
++		const char* value = std::getenv("KYTY_FRAME_TRACE");
++		state             = (value == nullptr || std::strcmp(value, "0") != 0) ? 1 : 0;
++		// Every thread derives the same value from the same environment, so a race here only
++		// stores it twice.
++		Detail::g_enabled.store(state, std::memory_order_relaxed);
++	}
++	return state != 0;
++}
++
++// --- Draw decoding -------------------------------------------------------------------------
++
++inline void NoteDecodedDirect() {
++	if (Enabled()) {
++		Detail::g_decoded_direct.Add();
++	}
++}
++inline void NoteDecodedIndexed() {
++	if (Enabled()) {
++		Detail::g_decoded_indexed.Add();
++	}
++}
++
++// Called for every indirect draw packet, whatever the count. `count_addr_used` is the packet's
++// COUNT_INDIRECT_ENABLE bit: when set, the count comes from guest memory.
++//
++// A zero count is NOT assumed to be a fault. On AMD hardware the GPU's command processor fetches
++// that word when the packet executes, and a GPU culling pass legitimately producing no draws
++// writes zero there. Two things are worth knowing and neither is settled here: whether the guest
++// expects the fetch to happen later than the emulator's CPU read at decode time, and whether
++// these zeros line up with the frames that never appear. So this records the context and counts
++// the occurrences, and changes nothing.
++inline void NoteIndirectCount(bool count_addr_used, uint32_t count_read, uint32_t max_count,
++                              uint64_t args_addr, bool indexed, uint64_t submit_id) {
++	if (!Enabled()) {
++		return;
++	}
++	Detail::g_decoded_indirect_packets.Add();
++	const uint32_t effective = count_addr_used ? (count_read < max_count ? count_read : max_count)
++	                                           : max_count;
++	if (effective == 0) {
++		Detail::g_indirect_count_zero.Add();
++	} else {
++		Detail::g_decoded_indirect_draws.Add(effective);
++	}
++	if (effective == 0 && Detail::g_detail_lines.Get() < MaxDetailLines) {
++		Detail::g_detail_lines.Add();
++		char now[32];
++		Detail::LocalTime(now, sizeof(now));
++		LOGF("FrameTrace detail: local_time=%s indirect draw count resolved to 0 "
++		     "(count_from_memory=%d count_read=%" PRIu32 " max_count=%" PRIu32
++		     " args_addr=0x%016" PRIx64 " indexed=%d submit=%" PRIu64
++		     ") - may be a legitimate empty culling result; not changed\n",
++		     now, count_addr_used ? 1 : 0, count_read, max_count, args_addr, indexed ? 1 : 0,
++		     submit_id);
++	}
++}
++
++// Called where a draw is recorded into a host command buffer.
++inline void NoteRecordedDraw() {
++	if (Enabled()) {
++		Detail::g_recorded_draws.Add();
++	}
++}
++
++// --- Graphics pipelines --------------------------------------------------------------------
++
++inline void NoteGraphicsPipelineAttempt() {
++	if (Enabled()) {
++		Detail::g_gfx_pipeline_attempts.Add();
++	}
++}
++inline void NoteGraphicsPipelineResult(bool success) {
++	if (!Enabled()) {
++		return;
++	}
++	if (success) {
++		Detail::g_gfx_pipeline_success.Add();
++	} else {
++		Detail::g_gfx_pipeline_failed.Add();
++	}
++}
++
++// --- Submission and presentation -----------------------------------------------------------
++
++inline void NoteQueueSubmit() {
++	if (Enabled()) {
++		Detail::g_submits.Add();
++	}
++}
++inline void NoteFlipRequested() {
++	if (Enabled()) {
++		Detail::g_flips_requested.Add();
++	}
++}
++
++// What vkQueuePresentKHR's result means for "did a frame reach the screen".
++// VK_SUBOPTIMAL_KHR is a Vulkan success code: the image WAS presented, the swapchain merely no
++// longer matches the surface exactly and should be recreated. It is a presented frame, counted
++// separately so a run of them stays visible. Every other non-success result presented nothing.
++enum class PresentOutcome { Presented, PresentedSuboptimal, NotPresented };
++
++[[nodiscard]] inline PresentOutcome PresentOutcomeOf(VkResult result) {
++	switch (result) {
++		case VK_SUCCESS: return PresentOutcome::Presented;
++		case VK_SUBOPTIMAL_KHR: return PresentOutcome::PresentedSuboptimal;
++		default: return PresentOutcome::NotPresented;
++	}
++}
++
++inline void NotePresent(PresentOutcome outcome) {
++	if (!Enabled()) {
++		return;
++	}
++	switch (outcome) {
++		case PresentOutcome::Presented: Detail::g_presents_ok.Add(); break;
++		case PresentOutcome::PresentedSuboptimal: Detail::g_presents_suboptimal.Add(); break;
++		case PresentOutcome::NotPresented: Detail::g_presents_failed.Add(); break;
++	}
++}
++
++// --- Queue stall state ---------------------------------------------------------------------
++
++// Called where a submission starts on a queue, with the id its processor was just given.
++inline void NoteSubmissionStart(uint32_t queue_id, uint64_t submit_id) {
++	if (!Enabled()) {
++		return;
++	}
++	Detail::g_queues[Detail::Slot(queue_id)].current_submit_id.store(submit_id,
++	                                                                  std::memory_order_relaxed);
++}
++
++// Called where a command processor suspends, before it returns Blocked. The reason is held on
++// this thread until the requeue that follows records it against the queue.
++inline void NoteSuspend(Reason reason, uint32_t arg0 = 0, uint32_t arg1 = 0) {
++	if (!Enabled()) {
++		return;
++	}
++	Detail::g_suspends.Add();
++	Detail::t_pending = {reason, arg0, arg1};
++}
++
++// Called where an incomplete submission is pushed back onto its queue. The first requeue of a
++// run stamps the clock; later ones leave it, so head_age_ms is the age of the current stall.
++// The id recorded is the stalled submission's own (see QueueStall::current_submit_id), not the
++// emulator's global submission counter, which other queues advance meanwhile.
++inline void NoteRequeue(uint32_t queue_id) {
++	if (!Enabled()) {
++		return;
++	}
++	Detail::g_requeues.Add();
++	auto& slot = Detail::g_queues[Detail::Slot(queue_id)];
++	slot.requeues.fetch_add(1, std::memory_order_relaxed);
++	slot.submit_id.store(slot.current_submit_id.load(std::memory_order_relaxed),
++	                     std::memory_order_relaxed);
++	const auto pending = Detail::t_pending;
++	slot.reason.store(static_cast<int>(pending.reason), std::memory_order_relaxed);
++	slot.arg0.store(pending.arg0, std::memory_order_relaxed);
++	slot.arg1.store(pending.arg1, std::memory_order_relaxed);
++	Detail::t_pending = {};
++	uint64_t expected = 0;
++	slot.since_us.compare_exchange_strong(expected, Detail::NowUs(), std::memory_order_relaxed);
++}
++
++// Called where a submission completes. Clears that queue's stall only.
++inline void NoteComplete(uint32_t queue_id) {
++	if (!Enabled()) {
++		return;
++	}
++	Detail::g_completions.Add();
++	auto& slot = Detail::g_queues[Detail::Slot(queue_id)];
++	slot.since_us.store(0, std::memory_order_relaxed);
++	slot.requeues.store(0, std::memory_order_relaxed);
++	slot.reason.store(static_cast<int>(Reason::None), std::memory_order_relaxed);
++	Detail::t_pending = {};
++}
++
++// --- Watchdog ------------------------------------------------------------------------------
++
++class Watchdog final {
++public:
++	Watchdog() = default;
++	~Watchdog() { Stop(); }
++	Watchdog(const Watchdog&)            = delete;
++	Watchdog& operator=(const Watchdog&) = delete;
++
++	void Start() {
++		std::lock_guard lock(m_mutex);
++		if (m_thread.joinable()) {
++			return;
++		}
++		m_stop   = false;
++		m_thread = std::thread([this] { Run(); });
++	}
++
++	// Wakes the watchdog and joins it, so no line can be written after this returns.
++	void Stop() {
++		{
++			std::lock_guard lock(m_mutex);
++			if (!m_thread.joinable()) {
++				return;
++			}
++			m_stop = true;
++		}
++		m_wake.notify_all();
++		m_thread.join();
++	}
++
++private:
++	struct Snapshot {
++		uint64_t decoded_direct, decoded_indexed, indirect_packets, indirect_draws,
++		    indirect_zero, recorded_draws, gfx_attempts, gfx_success, gfx_failed, submits,
++		    flips, presents_ok, presents_suboptimal, presents_failed, suspends, requeues,
++		    completions;
++	};
++
++	static Snapshot Take() {
++		using namespace Detail;
++		return Snapshot {g_decoded_direct.Get(),
++		                 g_decoded_indexed.Get(),
++		                 g_decoded_indirect_packets.Get(),
++		                 g_decoded_indirect_draws.Get(),
++		                 g_indirect_count_zero.Get(),
++		                 g_recorded_draws.Get(),
++		                 g_gfx_pipeline_attempts.Get(),
++		                 g_gfx_pipeline_success.Get(),
++		                 g_gfx_pipeline_failed.Get(),
++		                 g_submits.Get(),
++		                 g_flips_requested.Get(),
++		                 g_presents_ok.Get(),
++		                 g_presents_suboptimal.Get(),
++		                 g_presents_failed.Get(),
++		                 g_suspends.Get(),
++		                 g_requeues.Get(),
++		                 g_completions.Get()};
++	}
++
++	// Longest-standing stall across the queues, which is the one worth naming.
++	static void WorstStall(uint32_t* queue, uint64_t* age_ms, uint64_t* submit_id, int* reason,
++	                       uint32_t* arg0, uint32_t* arg1, uint64_t* requeues) {
++		*queue = 0;
++		*age_ms = 0;
++		*submit_id = 0;
++		*reason = static_cast<int>(Reason::None);
++		*arg0 = 0;
++		*arg1 = 0;
++		*requeues = 0;
++		const uint64_t now = Detail::NowUs();
++		uint64_t       oldest = 0;
++		for (uint32_t i = 0; i < MaxQueues; i++) {
++			const auto since = Detail::g_queues[i].since_us.load(std::memory_order_relaxed);
++			if (since == 0 || since >= now) {
++				continue;
++			}
++			const uint64_t age = now - since;
++			if (age > oldest) {
++				oldest     = age;
++				*queue     = i;
++				*age_ms    = age / 1000;
++				*submit_id = Detail::g_queues[i].submit_id.load(std::memory_order_relaxed);
++				*reason    = Detail::g_queues[i].reason.load(std::memory_order_relaxed);
++				*arg0      = Detail::g_queues[i].arg0.load(std::memory_order_relaxed);
++				*arg1      = Detail::g_queues[i].arg1.load(std::memory_order_relaxed);
++				*requeues  = Detail::g_queues[i].requeues.load(std::memory_order_relaxed);
++			}
++		}
++	}
++
++	void Run() {
++		const auto start    = std::chrono::steady_clock::now();
++		auto       last     = start;
++		Snapshot   previous = Take();
++		uint64_t   lines    = 0;
++		for (;;) {
++			{
++				std::unique_lock lock(m_mutex);
++				m_wake.wait_for(lock, std::chrono::seconds(5), [this] { return m_stop; });
++				if (m_stop) {
++					return;
++				}
++			}
++			const auto now = std::chrono::steady_clock::now();
++			const auto since_last_ms =
++			    std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count();
++			const auto uptime_s =
++			    std::chrono::duration_cast<std::chrono::seconds>(now - start).count();
++			last = now;
++
++			if (++lines > MaxTraceLines) {
++				LOGF("FrameTrace: line budget of %" PRIu64 " spent; stopping the trace\n",
++				     MaxTraceLines);
++				return;
++			}
++
++			char local_time[32];
++			Detail::LocalTime(local_time, sizeof(local_time));
++
++			const Snapshot current = Take();
++			uint32_t       queue = 0;
++			uint32_t       arg0 = 0;
++			uint32_t       arg1 = 0;
++			uint64_t       age_ms = 0;
++			uint64_t       submit_id = 0;
++			uint64_t       stall_requeues = 0;
++			int            reason = 0;
++			WorstStall(&queue, &age_ms, &submit_id, &reason, &arg0, &arg1, &stall_requeues);
++
++			LOGF("FrameTrace: local_time=%s uptime_s=%lld since_last_ms=%lld "
++			     "decoded_direct=%" PRIu64 " decoded_indexed=%" PRIu64
++			     " indirect_packets=%" PRIu64 " indirect_draws=%" PRIu64
++			     " indirect_count_zero=%" PRIu64 " recorded_draws=%" PRIu64
++			     " gfx_pipeline_attempts=%" PRIu64 " gfx_pipeline_ok=%" PRIu64
++			     " gfx_pipeline_failed=%" PRIu64 " submits=%" PRIu64 " flips_requested=%" PRIu64
++			     " presented=%" PRIu64 " presented_suboptimal=%" PRIu64
++			     " present_failed=%" PRIu64 " suspends=%" PRIu64
++			     " requeues=%" PRIu64 " completions=%" PRIu64 " stall_queue=%" PRIu32
++			     " stall_reason=%s stall_age_ms=%" PRIu64 " stall_submit=%" PRIu64
++			     " stall_requeues=%" PRIu64 " stall_arg0=%" PRIu32 " stall_arg1=%" PRIu32 "\n",
++			     local_time, static_cast<long long>(uptime_s),
++			     static_cast<long long>(since_last_ms),
++			     current.decoded_direct - previous.decoded_direct,
++			     current.decoded_indexed - previous.decoded_indexed,
++			     current.indirect_packets - previous.indirect_packets,
++			     current.indirect_draws - previous.indirect_draws,
++			     current.indirect_zero - previous.indirect_zero,
++			     current.recorded_draws - previous.recorded_draws,
++			     current.gfx_attempts - previous.gfx_attempts,
++			     current.gfx_success - previous.gfx_success,
++			     current.gfx_failed - previous.gfx_failed,
++			     current.submits - previous.submits, current.flips - previous.flips,
++			     (current.presents_ok + current.presents_suboptimal) -
++			         (previous.presents_ok + previous.presents_suboptimal),
++			     current.presents_suboptimal - previous.presents_suboptimal,
++			     current.presents_failed - previous.presents_failed,
++			     current.suspends - previous.suspends, current.requeues - previous.requeues,
++			     current.completions - previous.completions, queue, ReasonName(reason), age_ms,
++			     submit_id, stall_requeues, arg0, arg1);
++			previous = current;
++		}
++	}
++
++	std::thread             m_thread;
++	std::mutex              m_mutex;
++	std::condition_variable m_wake;
++	bool                    m_stop = false;
++};
++
++inline Watchdog& Instance() {
++	static Watchdog watchdog;
++	return watchdog;
++}
++
++inline void Start() {
++	if (Enabled()) {
++		Instance().Start();
++	}
++}
++
++// Not gated on Enabled(): a watchdog that was started is always joined.
++inline void Stop() { Instance().Stop(); }
++
++// Starts the watchdog for the life of a scope and joins it on the way out, so every exit path of
++// the owning thread stops it.
++struct ScopedTrace final {
++	ScopedTrace() { Start(); }
++	~ScopedTrace() { Stop(); }
++	ScopedTrace(const ScopedTrace&)            = delete;
++	ScopedTrace& operator=(const ScopedTrace&) = delete;
++};
++
++} // namespace Libs::Graphics::FrameProgress
++
++#endif // GRAPHICS_HOST_GPU_RENDERER_FRAME_PROGRESS_H_
+diff --git a/src/graphics/host_gpu/renderer/pipeline/shaders.cpp b/src/graphics/host_gpu/renderer/pipeline/shaders.cpp
+index 307cf016..534539f9 100644
+--- a/src/graphics/host_gpu/renderer/pipeline/shaders.cpp
++++ b/src/graphics/host_gpu/renderer/pipeline/shaders.cpp
+@@ -6,6 +6,7 @@
+ #include "graphics/guest_gpu/gpu_defs.h"
+ #include "graphics/host_gpu/graphicContext.h"
+ #include "graphics/host_gpu/renderer/debug.h"
++#include "graphics/host_gpu/renderer/frameProgress.h"
+ #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+ #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+ #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+@@ -581,8 +582,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
+ 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
+ 		     dynamic_state.dynamicStateCount);
+ 	}
++	FrameProgress::NoteGraphicsPipelineAttempt();
+ 	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
+ 	                                                 &pipeline.pipeline);
++	FrameProgress::NoteGraphicsPipelineResult(result == vk::Result::eSuccess);
+ 	if (graphics_debug_dump_enabled()) {
+ 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
+ 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
+diff --git a/src/graphics/host_gpu/renderer/renderDraw.cpp b/src/graphics/host_gpu/renderer/renderDraw.cpp
+index 4ea55439..b0376ef3 100644
+--- a/src/graphics/host_gpu/renderer/renderDraw.cpp
++++ b/src/graphics/host_gpu/renderer/renderDraw.cpp
+@@ -1,5 +1,7 @@
+ #include "graphics/host_gpu/renderer/renderDraw.h"
+ 
++#include "graphics/host_gpu/renderer/frameProgress.h"
++
+ #include "common/assert.h"
+ #include "common/common.h"
+ #include "common/debugCounters.h"
+@@ -1299,6 +1301,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
+ 		                       emit.indirect.count, emit.indirect.stride);
+ 	}
+ 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
++	FrameProgress::NoteRecordedDraw();
+ 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
+ 
+ 	if (!draw.IsIndexed()) {
+diff --git a/src/graphics/presentation/videoOut.cpp b/src/graphics/presentation/videoOut.cpp
+index 269d8f23..37c764d7 100644
+--- a/src/graphics/presentation/videoOut.cpp
++++ b/src/graphics/presentation/videoOut.cpp
+@@ -11,6 +11,7 @@
+ #include "common/threads.h"
+ #include "common/timer.h"
+ #include "graphics/guest_gpu/gpu_defs.h"
++#include "graphics/host_gpu/renderer/frameProgress.h"
+ #include "graphics/guest_gpu/graphicsRun.h"
+ #include "graphics/guest_gpu/tile.h"
+ #include "graphics/host_gpu/renderer/image/imageInfo.h"
+@@ -987,6 +988,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
+ 	pending.push_back(r);
+ 	request_id = r.id;
+ 	Common::DebugCounters::Add(Common::DebugCounters::Counter::FlipsRequested);
++	Graphics::FrameProgress::NoteFlipRequested();
+ 
+ 	cfg.flip_status.flipPendingNum++;
+ 	cfg.flip_status.submitProcessTimeCounter = r.submit_ptc;
+diff --git a/src/graphics/presentation/window/swapchain.cpp b/src/graphics/presentation/window/swapchain.cpp
+index 22b56b26..5ba32f81 100644
+--- a/src/graphics/presentation/window/swapchain.cpp
++++ b/src/graphics/presentation/window/swapchain.cpp
+@@ -8,6 +8,7 @@
+ #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
+ #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
+ #include "graphics/host_gpu/graphicContext.h"
++#include "graphics/host_gpu/renderer/frameProgress.h"
+ #include "graphics/host_gpu/renderer/render.h"
+ #include "graphics/host_gpu/renderer/renderContext.h"
+ #include "graphics/host_gpu/vulkanCommon.h"
+@@ -898,6 +899,7 @@ Swapchain::Status Swapchain::Present() {
+ 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
+ 		result = m_window.graphic_ctx.queue.presentKHR(&present);
+ 	}
++	FrameProgress::NotePresent(FrameProgress::PresentOutcomeOf(static_cast<VkResult>(result)));
+ 	switch (result) {
+ 		case vk::Result::eSuccess: break;
+ 		case vk::Result::eSuboptimalKHR:

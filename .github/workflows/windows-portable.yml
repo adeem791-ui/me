@@ -56,6 +56,10 @@ jobs:
           git -C source apply --check "$patch" || { echo "::error::patch 17 does not apply"; exit 1; }
           git -C source apply "$patch"
           echo "applied 17-vram-pressure-relief.patch"
+          patch="$GITHUB_WORKSPACE/patches/18-frame-progress-trace.patch"
+          git -C source apply --check "$patch" || { echo "::error::patch 18 does not apply"; exit 1; }
+          git -C source apply "$patch"
+          echo "applied 18-frame-progress-trace.patch"
 
       - name: VRAM relief policy test (GCC, ASan + UBSan)
         run: |
@@ -104,6 +108,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Patch 17 validation failed" }
           git -C source apply $patch
           if ($LASTEXITCODE -ne 0) { throw "Patch 17 application failed" }
+          $patch = Join-Path $env:GITHUB_WORKSPACE 'patches/18-frame-progress-trace.patch'
+          git -C source apply --check $patch
+          if ($LASTEXITCODE -ne 0) { throw "Patch 18 validation failed" }
+          git -C source apply $patch
+          if ($LASTEXITCODE -ne 0) { throw "Patch 18 application failed" }
 
       - name: Locate vcpkg
         id: vcpkg
@@ -189,6 +198,7 @@ jobs:
           Copy-Item 'source/LICENSE' (Join-Path $dest 'LICENSE_KytyPS5.txt')
           Copy-Item 'patches/01-16-rebased-on-9dcff95.patch' (Join-Path $dest '01-16-rebased-on-9dcff95.patch')
           Copy-Item 'patches/17-vram-pressure-relief.patch' (Join-Path $dest '17-vram-pressure-relief.patch')
+          Copy-Item 'patches/18-frame-progress-trace.patch' (Join-Path $dest '18-frame-progress-trace.patch')
           Copy-Item 'docs/vram-pressure-relief.md' (Join-Path $dest 'VRAM_RELIEF_README.md')
           Copy-Item 'scripts/START_SHARED_SHADER_CACHE.cmd' (Join-Path $dest 'START_SHARED_SHADER_CACHE.cmd')
           Copy-Item 'scripts/RECORD_COMPUTE_SHADERS.cmd' (Join-Path $dest 'RECORD_COMPUTE_SHADERS.cmd')
@@ -223,6 +233,8 @@ jobs:
           Requires Windows x64 and Vulkan-capable graphics drivers.
           No development software should be required to run the finished package.
           Includes patch 17 (VRAM pressure relief), untested on real hardware. See VRAM_RELIEF_README.md.
+          DIAGNOSTIC BUILD: adds patch 18 (frame-progress trace), logging only. Every 5 s the log gets a
+          "FrameTrace:" line. Set KYTY_FRAME_TRACE=0 to turn it off.
           Shader stack overflow patch is experimental and game compatibility is not guaranteed.
           Refer to this repository for the patch and corresponding upstream source.
           '@ | Set-Content (Join-Path $dest 'START_HERE.txt') -Encoding UTF8
@@ -230,12 +242,12 @@ jobs:
       - name: Archive portable Windows application
         shell: pwsh
         run: |
-          Compress-Archive -Path 'install/*' -DestinationPath "$env:RUNNER_TEMP/KytyPS5-Yotei-VRAM-Relief-Experimental.zip" -CompressionLevel Optimal
+          Compress-Archive -Path 'install/*' -DestinationPath "$env:RUNNER_TEMP/KytyPS5-Yotei-FrameTrace-Diagnostic.zip" -CompressionLevel Optimal
 
       - name: Upload compiled Windows package
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Yotei-VRAM-Relief-Experimental
-          path: ${{ runner.temp }}/KytyPS5-Yotei-VRAM-Relief-Experimental.zip
+          name: KytyPS5-Yotei-FrameTrace-Diagnostic
+          path: ${{ runner.temp }}/KytyPS5-Yotei-FrameTrace-Diagnostic.zip
           if-no-files-found: error
           retention-days: 14
