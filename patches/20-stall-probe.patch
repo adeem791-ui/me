@@ -1,0 +1,1969 @@
+diff --git a/src/graphics/guest_gpu/command_processor/commandProcessor.h b/src/graphics/guest_gpu/command_processor/commandProcessor.h
+index 1eb1d021..9890b818 100644
+--- a/src/graphics/guest_gpu/command_processor/commandProcessor.h
++++ b/src/graphics/guest_gpu/command_processor/commandProcessor.h
+@@ -2,6 +2,7 @@
+ #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
+ 
+ #include "common/assert.h"
++#include "graphics/guest_gpu/command_processor/waitRegMemProbe.h"
+ #include "graphics/guest_gpu/hardwareContext.h"
+ #include "graphics/host_gpu/renderer/render.h"
+ #include "graphics/host_gpu/renderer/renderContext.h"
+@@ -187,6 +188,8 @@ private:
+ 	uint64_t  m_submit_id                   = 0;
+ 	uint64_t  m_synthetic_occlusion_counter = 0;
+ 	bool      m_predicate_skip              = false;
++	// Diagnostic only: logs WAIT_REG_MEM waits that last long (see waitRegMemProbe.h).
++	WaitRegMemProbe::Tracker m_wait_probe;
+ };
+ 
+ } // namespace Libs::Graphics
+diff --git a/src/graphics/guest_gpu/command_processor/waitRegMemProbe.h b/src/graphics/guest_gpu/command_processor/waitRegMemProbe.h
+new file mode 100644
+index 00000000..7958899e
+--- /dev/null
++++ b/src/graphics/guest_gpu/command_processor/waitRegMemProbe.h
+@@ -0,0 +1,242 @@
++#ifndef GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_WAIT_REG_MEM_PROBE_H_
++#define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_WAIT_REG_MEM_PROBE_H_
++
++// Full detail of long WAIT_REG_MEM waits. Diagnostic only.
++//
++// FrameTrace (patch 18) names a wait_reg_mem stall but keeps only the low 32 bits of the
++// address and of the value. For every wait that lasts LongWaitUs or more, this logs:
++//
++//   begin          the full address, element size, comparison, reference, mask, the value read,
++//                  the packet's poll interval and operation, the submission and the queue;
++//   still_waiting  at 1 s, 5 s, 30 s, 120 s and 600 s, with the value read then;
++//   value_change   each change of the watched value seen at a poll while the wait is long
++//                  (MaxChangesPerWait per wait, MaxChangeLines per run);
++//   end            how long it lasted, how many times it was evaluated, first and final value,
++//                  and whether it ended satisfied or the processor moved on to another wait.
++//
++// A wait shorter than LongWaitUs logs nothing. At most MaxLongWaits waits are logged per run.
++//
++// It changes nothing: the command processor reads the value, makes its own comparison and
++// suspends exactly as before; this only looks at what it read and decided.
++// KYTY_STALL_PROBE=0 turns it off.
++
++#include "common/logging/log.h"
++#include "graphics/host_gpu/renderer/frameProgress.h"
++#include "kernel/stallProbe.h"
++
++#include <atomic>
++#include <cinttypes>
++#include <cstdint>
++
++namespace Libs::Graphics::WaitRegMemProbe {
++
++inline constexpr uint64_t LongWaitUs        = 200000;
++inline constexpr uint32_t MaxLongWaits      = 64;
++inline constexpr uint32_t MaxChangesPerWait = 16;
++inline constexpr uint32_t MaxChangeLines    = 256;
++inline constexpr uint64_t MilestonesMs[]    = {1000, 5000, 30000, 120000, 600000};
++inline constexpr uint32_t MilestoneCount    = sizeof(MilestonesMs) / sizeof(MilestonesMs[0]);
++
++// WAIT_REG_MEM function field: the test is "(value & mask) <op> ref".
++inline const char* CompareOperator(uint32_t func) {
++	switch (func) {
++		case 0: return "always";
++		case 1: return "<";
++		case 2: return "<=";
++		case 3: return "==";
++		case 4: return "!=";
++		case 5: return ">=";
++		case 6: return ">";
++		default: return "?";
++	}
++}
++
++// One WAIT_REG_MEM packet as the command processor evaluates it.
++struct Wait {
++	uint64_t addr          = 0; // full 64-bit guest address of the watched value
++	uint64_t ref           = 0;
++	uint64_t mask          = 0;
++	uint32_t func          = 0;
++	uint32_t size_bytes    = 4; // 4 for WAIT_REG_MEM, 8 for WAIT_REG_MEM_64
++	uint32_t poll          = 0; // the packet's poll interval field (the emulator does not use it)
++	uint32_t wait_op       = 0;
++	uint64_t submit_id     = 0;
++	bool     async_compute = false;
++};
++
++namespace Detail {
++
++inline std::atomic<uint32_t> g_long_waits {0};
++inline std::atomic<uint32_t> g_change_lines {0};
++inline std::atomic<bool>     g_budget_told {false};
++
++inline void ResetForTest() {
++	g_long_waits.store(0);
++	g_change_lines.store(0);
++	g_budget_told.store(false);
++}
++
++// The same packet re-evaluated: the processor re-runs a suspended WAIT_REG_MEM until it passes,
++// and a later submission running the same packet is a new wait.
++inline bool SameWait(const Wait& a, const Wait& b) {
++	return a.addr == b.addr && a.ref == b.ref && a.mask == b.mask && a.func == b.func &&
++	       a.size_bytes == b.size_bytes && a.submit_id == b.submit_id;
++}
++
++inline int HexDigits(uint32_t size_bytes) {
++	return size_bytes == 8 ? 16 : 8;
++}
++
++// The queue whose processor runs `submit_id`, from FrameTrace's per-queue state; -1 if unknown
++// (FrameTrace off, or the submission not found).
++inline int QueueOfSubmission(uint64_t submit_id) {
++	if (submit_id == 0 || !FrameProgress::Enabled()) {
++		return -1;
++	}
++	for (uint32_t i = 0; i < FrameProgress::MaxQueues; i++) {
++		if (FrameProgress::Detail::g_queues[i].current_submit_id.load(std::memory_order_relaxed) ==
++		    submit_id) {
++			return static_cast<int>(i);
++		}
++	}
++	return -1;
++}
++
++} // namespace Detail
++
++// Per command processor. Used only by the thread running that processor.
++class Tracker {
++public:
++	// Called on every WAIT_REG_MEM evaluation with the value the processor read and its verdict.
++	void Observe(const Wait& wait, uint64_t value, bool satisfied) {
++		if (satisfied && !m_active) {
++			return; // the common case: a wait that never had to wait
++		}
++		if (!StallProbe::Enabled()) {
++			m_active = false;
++			return;
++		}
++		ObserveAt(wait, value, satisfied, StallProbe::NowUs());
++	}
++
++	// Same, with the clock supplied (tests).
++	void ObserveAt(const Wait& wait, uint64_t value, bool satisfied, uint64_t now_us) {
++		if (m_active && !Detail::SameWait(wait, m_wait)) {
++			// The processor is evaluating a different packet without this one having passed
++			// here (for example its submission was dropped).
++			End("superseded", m_last_value, now_us);
++		}
++		if (!m_active) {
++			if (satisfied) {
++				return;
++			}
++			m_active      = true;
++			m_wait        = wait;
++			m_start_us    = now_us;
++			m_first_value = value;
++			m_last_value  = value;
++			m_evaluations = 1;
++			m_changes     = 0;
++			m_long        = false;
++			m_id          = 0;
++			m_milestone   = 0;
++			return;
++		}
++
++		m_evaluations++;
++		const uint64_t waited_ms = (now_us - m_start_us) / 1000;
++		if (value != m_last_value) {
++			m_changes++;
++			if (m_id != 0 && m_changes <= MaxChangesPerWait &&
++			    Detail::g_change_lines.fetch_add(1, std::memory_order_relaxed) < MaxChangeLines) {
++				const int w = Detail::HexDigits(m_wait.size_bytes);
++				LOGF("WaitRegMemProbe: wait=%" PRIu32 " value_change waited_ms=%" PRIu64
++				     " evaluations=%" PRIu64 " value=0x%0*" PRIx64 " masked=0x%0*" PRIx64
++				     " previous=0x%0*" PRIx64 "\n",
++				     m_id, waited_ms, m_evaluations, w, value, w, value & m_wait.mask, w,
++				     m_last_value);
++			}
++			m_last_value = value;
++		}
++		if (satisfied) {
++			End("satisfied", value, now_us);
++			return;
++		}
++		if (!m_long && now_us - m_start_us >= LongWaitUs) {
++			m_long = true;
++			StallProbe::PublishLongWaitAddress(m_wait.addr);
++			const uint32_t n = Detail::g_long_waits.fetch_add(1, std::memory_order_relaxed) + 1;
++			if (n <= MaxLongWaits) {
++				m_id = n;
++				LogBegin(value, waited_ms);
++			} else if (!Detail::g_budget_told.exchange(true)) {
++				LOGF("WaitRegMemProbe: %" PRIu32 " long waits logged; later ones are not\n",
++				     MaxLongWaits);
++			}
++		}
++		if (m_id != 0 && m_milestone < MilestoneCount && waited_ms >= MilestonesMs[m_milestone]) {
++			while (m_milestone < MilestoneCount && waited_ms >= MilestonesMs[m_milestone]) {
++				m_milestone++; // one line even if a slow poll passed several milestones
++			}
++			const int w = Detail::HexDigits(m_wait.size_bytes);
++			char      now[32];
++			StallProbe::LocalTime(now, sizeof(now));
++			LOGF("WaitRegMemProbe: wait=%" PRIu32 " still_waiting local_time=%s waited_ms=%" PRIu64
++			     " evaluations=%" PRIu64 " changes=%" PRIu32 " value=0x%0*" PRIx64
++			     " masked=0x%0*" PRIx64 " condition=(value&mask)%sref ref=0x%0*" PRIx64 "\n",
++			     m_id, now, waited_ms, m_evaluations, m_changes, w, value, w, value & m_wait.mask,
++			     CompareOperator(m_wait.func), w, m_wait.ref);
++		}
++	}
++
++	[[nodiscard]] bool Active() const { return m_active; }
++
++private:
++	void LogBegin(uint64_t value, uint64_t waited_ms) const {
++		const int w = Detail::HexDigits(m_wait.size_bytes);
++		char      now[32];
++		StallProbe::LocalTime(now, sizeof(now));
++		LOGF("WaitRegMemProbe: wait=%" PRIu32 " begin local_time=%s queue=%d submit=%" PRIu64
++		     " async_compute=%d addr=0x%016" PRIx64 " bits=%" PRIu32
++		     " condition=(value&mask)%sref func=%" PRIu32 " ref=0x%0*" PRIx64 " mask=0x%0*" PRIx64
++		     " value=0x%0*" PRIx64 " masked=0x%0*" PRIx64 " first_value=0x%0*" PRIx64
++		     " poll=%" PRIu32 " wait_op=%" PRIu32 " waited_ms=%" PRIu64 " evaluations=%" PRIu64
++		     "\n",
++		     m_id, now, Detail::QueueOfSubmission(m_wait.submit_id), m_wait.submit_id,
++		     m_wait.async_compute ? 1 : 0, m_wait.addr, m_wait.size_bytes * 8,
++		     CompareOperator(m_wait.func), m_wait.func, w, m_wait.ref, w, m_wait.mask, w, value, w,
++		     value & m_wait.mask, w, m_first_value, m_wait.poll, m_wait.wait_op, waited_ms,
++		     m_evaluations);
++	}
++
++	void End(const char* result, uint64_t final_value, uint64_t now_us) {
++		if (m_id != 0) {
++			const int w = Detail::HexDigits(m_wait.size_bytes);
++			char      now[32];
++			StallProbe::LocalTime(now, sizeof(now));
++			LOGF("WaitRegMemProbe: wait=%" PRIu32 " end result=%s local_time=%s waited_ms=%" PRIu64
++			     " evaluations=%" PRIu64 " changes=%" PRIu32 " first_value=0x%0*" PRIx64
++			     " final_value=0x%0*" PRIx64 "\n",
++			     m_id, result, now, (now_us - m_start_us) / 1000, m_evaluations, m_changes, w,
++			     m_first_value, w, final_value);
++		}
++		m_active = false;
++		m_long   = false;
++		m_id     = 0;
++	}
++
++	bool     m_active      = false;
++	Wait     m_wait        = {};
++	uint64_t m_start_us    = 0;
++	uint64_t m_first_value = 0;
++	uint64_t m_last_value  = 0;
++	uint64_t m_evaluations = 0;
++	uint32_t m_changes     = 0;
++	bool     m_long        = false;
++	uint32_t m_id          = 0; // 1-based number in the log; 0 = not logged
++	uint32_t m_milestone   = 0; // next entry of MilestonesMs to report
++};
++
++} // namespace Libs::Graphics::WaitRegMemProbe
++
++#endif // GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_WAIT_REG_MEM_PROBE_H_
+diff --git a/src/graphics/guest_gpu/graphicsRun.cpp b/src/graphics/guest_gpu/graphicsRun.cpp
+index f927f6e5..bf7acbd7 100644
+--- a/src/graphics/guest_gpu/graphicsRun.cpp
++++ b/src/graphics/guest_gpu/graphicsRun.cpp
+@@ -315,12 +315,18 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
+ 		EXIT("unsupported wait_reg_mem operation: 0x%08" PRIx32 "\n", wait_op);
+ 	}
+ 
+-	(void)poll;
+-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
++	// One read, used for the test and for the diagnostics alike.
++	const T    value     = *addr;
++	const bool satisfied = TestWaitRegMemValue(value, ref, mask, func);
++	m_wait_probe.Observe({reinterpret_cast<uint64_t>(addr), ref, mask, func,
++	                      static_cast<uint32_t>(sizeof(T)), poll, wait_op, m_submit_id,
++	                      IsAsyncComputeQueue()},
++	                     value, satisfied);
++	if (!satisfied) {
+ 		// arg0/arg1: the low half of the watched address, and the value seen there now.
+ 		FrameProgress::NoteSuspend(FrameProgress::Reason::WaitRegMem,
+ 		                           static_cast<uint32_t>(reinterpret_cast<uintptr_t>(addr)),
+-		                           static_cast<uint32_t>(*addr));
++		                           static_cast<uint32_t>(value));
+ 		SuspendPm4();
+ 	}
+ }
+diff --git a/src/kernel/mainThreadSampler.cpp b/src/kernel/mainThreadSampler.cpp
+new file mode 100644
+index 00000000..48b0f2ee
+--- /dev/null
++++ b/src/kernel/mainThreadSampler.cpp
+@@ -0,0 +1,872 @@
++#include "kernel/mainThreadSampler.h"
++
++#include "common/common.h"
++#include "common/logging/log.h"
++#include "common/singleton.h"
++#include "kernel/stallProbe.h"
++#include "loader/runtimeLinker.h"
++
++#include <chrono>
++#include <cinttypes>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <utility>
++#include <vector>
++
++#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#endif
++
++namespace Libs::MainThreadSampler {
++
++namespace {
++
++using namespace Detail;
++
++const char* JoinName() {
++	const char* value = std::getenv("KYTY_STALL_PROBE_JOIN");
++	return (value != nullptr && value[0] != '\0') ? value : "GameState";
++}
++
++struct Request {
++	uint64_t main_host_tid  = 0;
++	int      main_id        = 0;
++	int      joiner_id      = 0;
++	uint32_t campaign       = 0;
++	char     joined[64]     = {};
++	char     local_time[32] = {};
++};
++
++#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
++
++bool CodeBytesEnabled() {
++	const char* value = std::getenv("KYTY_STALL_PROBE_CODE");
++	return value == nullptr || std::strcmp(value, "0") != 0;
++}
++
++constexpr const char* RegNames[16] = {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
++                                      "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15"};
++
++// One sample, filled while the main thread is suspended. Fixed size: nothing is allocated then.
++struct RawSample {
++	uint64_t t_us            = 0; // since the campaign started
++	bool     ok              = false;
++	uint32_t error           = 0;
++	uint64_t rip             = 0;
++	uint64_t rflags          = 0;
++	uint64_t gpr[16]         = {}; // RegNames order
++	uint64_t target[16]      = {}; // the 8 bytes each register points at, where readable
++	uint32_t target_ok       = 0;  // bit i: target[i] valid
++	uint32_t stack_bytes     = 0;
++	uint64_t pause_ns        = 0; // SuspendThread call to ResumeThread return
++	uint32_t prior_suspend   = 0; // SuspendThread's return: > 0 = already suspended by someone else
++	uint32_t resume_attempts = 0;
++	uint8_t  stack[StackBytes] = {};
++};
++
++bool Readable(uint64_t addr) {
++	MEMORY_BASIC_INFORMATION info {};
++	if (addr < 0x10000 || VirtualQuery(reinterpret_cast<LPCVOID>(addr), &info, sizeof(info)) == 0) {
++		return false;
++	}
++	// Guard pages are skipped: touching one, even from a system call, clears its guard state
++	// and would break the owning thread's stack growth.
++	constexpr DWORD READABLE = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
++	                           PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
++	return info.State == MEM_COMMIT && (info.Protect & READABLE) != 0 &&
++	       (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
++}
++
++// Reads `size` bytes within one page. A system call copy: it cannot fault, and it does not go
++// through the emulator's access-tracking handlers.
++bool ReadInPage(uint64_t addr, void* out, size_t size) {
++	SIZE_T done = 0;
++	return Readable(addr) &&
++	       ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(addr), out, size,
++	                         &done) != 0 &&
++	       done == size;
++}
++
++// Reads up to `size` bytes, stopping at the first page that cannot be read. Returns bytes read.
++size_t ReadUpTo(uint64_t addr, uint8_t* out, size_t size) {
++	size_t total = 0;
++	while (total < size) {
++		const uint64_t at      = addr + total;
++		const size_t   in_page = 4096 - static_cast<size_t>(at & 4095u);
++		const size_t   chunk   = std::min(in_page, size - total);
++		if (!ReadInPage(at, out + total, chunk)) {
++			break;
++		}
++		total += chunk;
++	}
++	return total;
++}
++
++bool SafeRead(uint64_t addr, void* out, size_t size) {
++	return ReadUpTo(addr, static_cast<uint8_t*>(out), size) == size;
++}
++
++uint64_t FileTimeValue(const FILETIME& t) {
++	return (static_cast<uint64_t>(t.dwHighDateTime) << 32u) | t.dwLowDateTime;
++}
++
++// Kernel + user time in 100 ns units; UINT64_MAX if unavailable.
++uint64_t ThreadCpu(HANDLE thread) {
++	FILETIME creation {};
++	FILETIME exit {};
++	FILETIME kernel {};
++	FILETIME user {};
++	if (GetThreadTimes(thread, &creation, &exit, &kernel, &user) == 0) {
++		return UINT64_MAX;
++	}
++	return FileTimeValue(kernel) + FileTimeValue(user);
++}
++
++// Names addresses. Built per burst, after the main thread is running again.
++class Resolver {
++public:
++	explicit Resolver(const FunctionList& hle): m_hle(hle) {
++		auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
++		for (const auto& p: rt->SnapshotProgramRanges()) {
++			m_guests.push_back({p.file_name, p.base_vaddr, p.base_vaddr + p.base_size_aligned,
++			                    p.base_vaddr + p.mapped_size});
++		}
++		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++		                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++		                   reinterpret_cast<LPCWSTR>(&NoteJoin), &m_emulator);
++	}
++
++	[[nodiscard]] const std::vector<GuestRange>& Guests() const { return m_guests; }
++
++	struct Location {
++		Kind        kind = Kind::Unknown;
++		std::string text;
++		std::string hle; // the HLE function an emulator address is near, if any
++	};
++
++	Location Describe(uint64_t addr) {
++		Location loc;
++		char     buf[256];
++		bool     stub = false;
++		if (const auto* guest = FindGuest(m_guests, addr, &stub); guest != nullptr) {
++			loc.kind = stub ? Kind::GuestStub : Kind::Guest;
++			std::snprintf(buf, sizeof(buf), "%s %s+0x%" PRIx64, KindName(loc.kind),
++			              guest->name.c_str(), addr - guest->base);
++			loc.text = buf;
++			return loc;
++		}
++		if (const auto* module = ModuleOf(addr); module != nullptr) {
++			const auto rva =
++			    static_cast<uint32_t>(addr - reinterpret_cast<uint64_t>(module->handle));
++			if (module->emulator) {
++				loc.kind = Kind::Emulator;
++				std::snprintf(buf, sizeof(buf), "emulator %s+0x%" PRIx32, module->name.c_str(),
++				              rva);
++				loc.text = buf;
++				if (const auto* fn = NearestFunction(m_hle, addr);
++				    fn != nullptr && addr - fn->first < 0x4000) {
++					std::snprintf(buf, sizeof(buf), " near_hle=%.96s+0x%" PRIx64,
++					              fn->second.c_str(), addr - fn->first);
++					loc.text += buf;
++					loc.hle = fn->second;
++				}
++				return loc;
++			}
++			uint32_t    export_rva = 0;
++			const char* name       = NearestExport(reinterpret_cast<const uint8_t*>(module->handle),
++			                                       module->size, rva, &export_rva);
++			loc.kind               = ClassifyHost(false, module->name.c_str(), name);
++			if (name != nullptr) {
++				std::snprintf(buf, sizeof(buf), "%s %s!%.96s+0x%" PRIx32, KindName(loc.kind),
++				              module->name.c_str(), name, rva - export_rva);
++			} else {
++				std::snprintf(buf, sizeof(buf), "%s %s+0x%" PRIx32, KindName(loc.kind),
++				              module->name.c_str(), rva);
++			}
++			loc.text = buf;
++			return loc;
++		}
++		MEMORY_BASIC_INFORMATION info {};
++		loc.kind = Kind::Unknown;
++		if (VirtualQuery(reinterpret_cast<LPCVOID>(addr), &info, sizeof(info)) == 0 ||
++		    info.State != MEM_COMMIT) {
++			loc.text = "unknown unmapped";
++		} else {
++			constexpr DWORD EXEC =
++			    PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
++			std::snprintf(buf, sizeof(buf), "unknown %s alloc=0x%016" PRIx64 "+0x%" PRIx64,
++			              (info.Protect & EXEC) != 0 ? "anon_exec" : "not_executable",
++			              reinterpret_cast<uint64_t>(info.AllocationBase),
++			              addr - reinterpret_cast<uint64_t>(info.AllocationBase));
++			loc.text = buf;
++		}
++		return loc;
++	}
++
++	// What a call went to: an HLE function by name when it is exactly one, else a location.
++	std::string DescribeCallee(uint64_t dest) {
++		if (dest == 0) {
++			return "?";
++		}
++		if (FindGuest(m_guests, dest, nullptr) == nullptr) {
++			if (const auto* fn = NearestFunction(m_hle, dest); fn != nullptr && fn->first == dest) {
++				return "HLE " + fn->second;
++			}
++		}
++		return Describe(dest).text;
++	}
++
++private:
++	struct Module {
++		HMODULE     handle = nullptr;
++		std::string name;
++		bool        emulator = false;
++		uint32_t    size     = 0;
++	};
++
++	const Module* ModuleOf(uint64_t addr) {
++		HMODULE handle = nullptr;
++		if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++		                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++		                       reinterpret_cast<LPCWSTR>(addr), &handle) == 0 ||
++		    handle == nullptr) {
++			return nullptr;
++		}
++		for (const auto& module: m_modules) {
++			if (module.handle == handle) {
++				return &module;
++			}
++		}
++		Module module;
++		module.handle                 = handle;
++		module.emulator               = handle == m_emulator;
++		module.size                   = PeImageSize(reinterpret_cast<const uint8_t*>(handle), 4096);
++		wchar_t        path[MAX_PATH] = {};
++		const DWORD    length         = GetModuleFileNameW(handle, path, MAX_PATH);
++		const wchar_t* base           = path;
++		for (DWORD i = 0; i < length; i++) {
++			if (path[i] == L'\\' || path[i] == L'/') {
++				base = path + i + 1;
++			}
++		}
++		char name[MAX_PATH] = {};
++		if (WideCharToMultiByte(CP_UTF8, 0, base, -1, name, static_cast<int>(sizeof(name)), nullptr,
++		                        nullptr) == 0) {
++			std::snprintf(name, sizeof(name), "module@0x%016" PRIx64,
++			              reinterpret_cast<uint64_t>(handle));
++		}
++		module.name = name;
++		m_modules.push_back(module);
++		return &m_modules.back();
++	}
++
++	const FunctionList&     m_hle;
++	std::vector<GuestRange> m_guests;
++	std::vector<Module>     m_modules;
++	HMODULE                 m_emulator = nullptr;
++};
++
++#endif // KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
++
++class Sampler final {
++public:
++	Sampler() = default;
++	~Sampler() {
++		{
++			std::lock_guard lock(m_mutex);
++			m_stop = true;
++		}
++		m_wake.notify_all();
++		if (m_thread.joinable()) {
++			m_thread.join();
++		}
++	}
++	Sampler(const Sampler&)            = delete;
++	Sampler& operator=(const Sampler&) = delete;
++
++	static Sampler& Instance() {
++		static Sampler sampler;
++		return sampler;
++	}
++
++	void Submit(Request request) {
++		bool over_cap      = false;
++		bool tell_cap      = false;
++		bool disabled_line = false;
++		{
++			std::lock_guard lock(m_mutex);
++			if (m_stop) {
++				return;
++			}
++			if (m_disabled) {
++				if (!std::exchange(m_disabled_told, true)) {
++					disabled_line = true;
++				}
++				over_cap = true;
++			} else if (m_campaigns >= MaxCampaigns) {
++				over_cap = true;
++				tell_cap = !std::exchange(m_cap_told, true);
++			} else {
++				request.campaign = ++m_campaigns;
++				m_request        = request;
++				m_has_request    = true;
++				if (!m_thread.joinable()) {
++					m_thread = std::thread([this] { Run(); });
++				}
++			}
++		}
++		if (over_cap) {
++			if (disabled_line) {
++				LOGF("MainSampler: join of %s at %s not sampled: sampling stopped earlier in "
++				     "this run after a ResumeThread failure\n",
++				     request.joined, request.local_time);
++			}
++			if (tell_cap) {
++				LOGF("MainSampler: join of %s at %s not sampled: %" PRIu32
++				     " campaigns per run already used\n",
++				     request.joined, request.local_time, MaxCampaigns);
++			}
++			return;
++		}
++		m_wake.notify_all();
++	}
++
++private:
++	void Run() {
++		for (;;) {
++			Request request;
++			{
++				std::unique_lock lock(m_mutex);
++				m_wake.wait(lock, [this] { return m_stop || m_has_request; });
++				if (m_stop) {
++					return;
++				}
++				request       = m_request;
++				m_has_request = false;
++			}
++			RunCampaign(request);
++		}
++	}
++
++	// Waits until `when`. False if a new campaign or shutdown interrupts.
++	bool WaitUntil(std::chrono::steady_clock::time_point when) {
++		std::unique_lock lock(m_mutex);
++		m_wake.wait_until(lock, when, [this] { return m_stop || m_has_request; });
++		return !m_stop && !m_has_request;
++	}
++
++	[[nodiscard]] const char* Interruption() {
++		std::lock_guard lock(m_mutex);
++		return m_stop ? "stopping" : "superseded_by_next_join";
++	}
++
++#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
++	void RunCampaign(const Request& r) {
++		HANDLE thread =
++		    OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE,
++		               static_cast<DWORD>(r.main_host_tid));
++		if (thread == nullptr) {
++			LOGF("MainSampler: campaign=%" PRIu32 " cannot open the main thread (host_tid=%" PRIu64
++			     ", error %lu); not sampled\n",
++			     r.campaign, r.main_host_tid, GetLastError());
++			return;
++		}
++		std::string schedule;
++		for (uint32_t i = 0; i < BurstCount; i++) {
++			schedule += (i == 0 ? "" : ",") + std::to_string(BurstOffsetsS[i]);
++		}
++		LOGF("MainSampler: campaign=%" PRIu32 " start local_time=%s trigger=join:%s joiner_id=%d "
++		     "target=main_thread guest_id=%d host_tid=%" PRIu64 " bursts_at_s=%s "
++		     "samples_per_burst=%" PRIu32 " interval_ms=%" PRIu32 " stack_bytes=%" PRIu32 "\n",
++		     r.campaign, r.local_time, r.joined, r.joiner_id, r.main_id, r.main_host_tid,
++		     schedule.c_str(), SamplesPerBurst, SampleIntervalMs, StackBytes);
++
++		if (m_samples.empty()) {
++			m_samples.resize(SamplesPerBurst);
++		}
++		LARGE_INTEGER frequency {};
++		QueryPerformanceFrequency(&frequency);
++		m_qpc_frequency = frequency.QuadPart > 0 ? static_cast<uint64_t>(frequency.QuadPart) : 1;
++		uint64_t    campaign_samples  = 0;
++		uint64_t    campaign_pause_ns = 0;
++		uint64_t    campaign_max_ns   = 0;
++		const auto  start             = std::chrono::steady_clock::now();
++		uint64_t    prev_cpu          = ThreadCpu(thread);
++		auto        prev_at           = start;
++		std::string prev_top;
++		std::string prev_guest_top;
++		const char* end = "schedule_done";
++		for (uint32_t b = 0; b < BurstCount; b++) {
++			if (!WaitUntil(start + std::chrono::seconds(BurstOffsetsS[b]))) {
++				end = Interruption();
++				break;
++			}
++			ULONG64        cycles_begin = 0;
++			ULONG64        cycles_end   = 0;
++			const bool     cycles_ok    = QueryThreadCycleTime(thread, &cycles_begin) != 0;
++			const auto     burst_begin  = std::chrono::steady_clock::now();
++			const uint32_t ok           = TakeBurst(thread, start);
++			const auto     burst_end    = std::chrono::steady_clock::now();
++			if (m_resume_failure.failed) {
++				// The main thread may still be suspended, possibly holding a lock the naming code
++				// or the logger needs, so nothing else runs: one line, then sampling stops for
++				// the rest of the run.
++				LOGF("MainSampler: campaign=%" PRIu32 " burst=%" PRIu32 " sample=%" PRIu32
++				     " ResumeThread FAILED %" PRIu32 " times (last error %" PRIu32
++				     "); the main thread may still be suspended; sampling stopped for this run\n",
++				     r.campaign, b + 1, m_resume_failure.sample, m_resume_failure.attempts,
++				     m_resume_failure.error);
++				{
++					std::lock_guard lock(m_mutex);
++					m_disabled = true;
++				}
++				end = "resume_failed";
++				break;
++			}
++			const bool     cycles_ok2 = QueryThreadCycleTime(thread, &cycles_end) != 0;
++			const uint64_t cpu        = ThreadCpu(thread);
++
++			BurstStats stats;
++			stats.samples = m_taken;
++			for (uint32_t i = 0; i < m_taken; i++) {
++				campaign_pause_ns += m_samples[i].pause_ns;
++				campaign_max_ns = std::max(campaign_max_ns, m_samples[i].pause_ns);
++			}
++			campaign_samples += m_taken;
++			const auto window_us =
++			    std::chrono::duration_cast<std::chrono::microseconds>(burst_end - prev_at).count();
++			if (cpu != UINT64_MAX && prev_cpu != UINT64_MAX && window_us > 0) {
++				stats.cpu_pct = static_cast<double>(cpu - prev_cpu) / 10.0 * 100.0 /
++				                static_cast<double>(window_us);
++			}
++			const auto burst_us =
++			    std::chrono::duration_cast<std::chrono::microseconds>(burst_end - burst_begin)
++			        .count();
++			const double cycles_per_us =
++			    (cycles_ok && cycles_ok2 && burst_us > 0)
++			        ? static_cast<double>(cycles_end - cycles_begin) / static_cast<double>(burst_us)
++			        : -1.0;
++			Report(r, b, stats, cycles_per_us, static_cast<uint64_t>(window_us) / 1000,
++			       static_cast<uint64_t>(burst_us), &prev_top, &prev_guest_top);
++			prev_cpu = cpu;
++			prev_at  = burst_end;
++			if (ok == 0 && m_samples[0].error == ERROR_INVALID_HANDLE) {
++				end = "thread_gone";
++				break;
++			}
++			if (ok == 0) {
++				DWORD exit_code = 0;
++				if (GetExitCodeThread(thread, &exit_code) != 0 && exit_code != STILL_ACTIVE) {
++					end = "thread_exited";
++					break;
++				}
++			}
++		}
++		CloseHandle(thread);
++		char now[32];
++		StallProbe::LocalTime(now, sizeof(now));
++		LOGF("MainSampler: campaign=%" PRIu32 " end reason=%s local_time=%s samples=%" PRIu64
++		     " main_thread_paused_us_total=%.1f pause_us_max=%.1f\n",
++		     r.campaign, end, now, campaign_samples,
++		     static_cast<double>(campaign_pause_ns) / 1000.0,
++		     static_cast<double>(campaign_max_ns) / 1000.0);
++	}
++
++	// Takes one burst into m_samples. Between SuspendThread and ResumeThread only system calls
++	// run: no allocation, no lock, no logging. Every ResumeThread is checked and retried; if it
++	// still fails, the burst stops at once and m_resume_failure says so. Returns how many samples
++	// succeeded; m_taken is how many were attempted.
++	uint32_t TakeBurst(HANDLE thread, std::chrono::steady_clock::time_point start) {
++		uint32_t ok      = 0;
++		m_taken          = 0;
++		m_resume_failure = {};
++		for (uint32_t i = 0; i < SamplesPerBurst; i++) {
++			if (i != 0) {
++				std::this_thread::sleep_for(std::chrono::milliseconds(SampleIntervalMs));
++			}
++			RawSample& s = m_samples[i];
++			s.t_us  = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
++                                               std::chrono::steady_clock::now() - start)
++			                                    .count());
++			s.ok    = false;
++			s.error = 0;
++			s.target_ok       = 0;
++			s.stack_bytes     = 0;
++			s.pause_ns        = 0;
++			s.prior_suspend   = 0;
++			s.resume_attempts = 0;
++			m_taken           = i + 1;
++
++			LARGE_INTEGER paused_at {};
++			QueryPerformanceCounter(&paused_at);
++			const DWORD prior = SuspendThread(thread);
++			if (prior == static_cast<DWORD>(-1)) {
++				s.error = GetLastError();
++				continue;
++			}
++			s.prior_suspend = prior;
++			CONTEXT context {};
++			context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
++			if (GetThreadContext(thread, &context) != 0) {
++				s.ok                    = true;
++				s.rip                   = context.Rip;
++				s.rflags                = context.EFlags;
++				const uint64_t regs[16] = {context.Rax, context.Rcx, context.Rdx, context.Rbx,
++				                           context.Rsp, context.Rbp, context.Rsi, context.Rdi,
++				                           context.R8,  context.R9,  context.R10, context.R11,
++				                           context.R12, context.R13, context.R14, context.R15};
++				for (uint32_t r = 0; r < 16; r++) {
++					s.gpr[r] = regs[r];
++					if (r != 4 && SafeRead(regs[r], &s.target[r], sizeof(uint64_t))) {
++						s.target_ok |= 1u << r;
++					}
++				}
++				s.stack_bytes = static_cast<uint32_t>(ReadUpTo(context.Rsp, s.stack, StackBytes));
++			} else {
++				s.error = GetLastError();
++			}
++			const ResumeOutcome resume = ResumeWithRetry(
++			    [thread](uint32_t* error) -> uint32_t {
++				    const DWORD previous = ResumeThread(thread);
++				    if (previous == static_cast<DWORD>(-1)) {
++					    *error = GetLastError();
++					    return UINT32_MAX;
++				    }
++				    return previous;
++			    },
++			    ResumeAttempts);
++			LARGE_INTEGER resumed_at {};
++			QueryPerformanceCounter(&resumed_at);
++			s.pause_ns = static_cast<uint64_t>(resumed_at.QuadPart - paused_at.QuadPart) *
++			             1000000000ull / m_qpc_frequency;
++			s.resume_attempts = resume.attempts;
++			if (!resume.resumed) {
++				s.ok             = false;
++				m_resume_failure = {true, i, resume.attempts, resume.error};
++				break;
++			}
++			ok += s.ok ? 1 : 0;
++		}
++		return ok;
++	}
++
++	// Names, tallies and logs one burst. The main thread is running again.
++	void Report(const Request& r, uint32_t b, BurstStats& stats, double cycles_per_us,
++	            uint64_t cpu_window_ms, uint64_t burst_us, std::string* prev_top,
++	            std::string* prev_guest_top) {
++		if (m_hle.empty()) {
++			// Once: the HLE table is complete before any guest code runs.
++			m_hle = Common::Singleton<Loader::RuntimeLinker>::Instance()->SnapshotHleFunctions();
++			std::sort(m_hle.begin(), m_hle.end());
++		}
++		Resolver   resolver(m_hle);
++		const auto read = [](uint64_t addr, void* out, size_t size) {
++			return SafeRead(addr, out, size);
++		};
++
++		std::vector<Resolver::Location> locations(m_taken);
++		std::vector<std::string>        location_keys(m_taken);
++		std::vector<std::string>        entry_keys;
++		std::vector<std::string>        caller_text(m_taken);
++		std::vector<uint64_t>           rips;
++		for (uint32_t i = 0; i < m_taken; i++) {
++			const RawSample& s = m_samples[i];
++			if (!s.ok) {
++				stats.by_kind[static_cast<uint32_t>(Kind::Failed)]++;
++				continue;
++			}
++			locations[i]     = resolver.Describe(s.rip);
++			location_keys[i] = locations[i].text;
++			stats.by_kind[static_cast<uint32_t>(locations[i].kind)]++;
++			if (std::find(rips.begin(), rips.end(), s.rip) == rips.end()) {
++				rips.push_back(s.rip);
++			}
++
++			uint64_t       rets[MaxCallers] = {};
++			CallSite       sites[MaxCallers];
++			const uint32_t callers = ScanGuestReturnAddresses(
++			    s.stack, s.stack_bytes, resolver.Guests(), read, rets, sites, MaxCallers);
++			std::string first_callee;
++			for (uint32_t c = 0; c < callers; c++) {
++				const std::string callee =
++				    sites[c].form == CallForm::Indirect
++				        ? std::string("(indirect)")
++				        : resolver.DescribeCallee(ResolveCallee(sites[c], resolver.Guests(), read));
++				if (c == 0) {
++					first_callee = callee;
++				}
++				caller_text[i] +=
++				    (c == 0 ? "" : "; ") + resolver.Describe(rets[c]).text + " -> " + callee;
++			}
++			const Kind kind = locations[i].kind;
++			if (kind == Kind::Emulator || kind == Kind::OsWait || kind == Kind::OsYield ||
++			    kind == Kind::HostOther) {
++				stats.host_samples++;
++				// The emulator entry point this host sample is under: the HLE function the guest
++				// called, read from the guest's call site, else the nearest HLE function.
++				entry_keys.push_back(first_callee.rfind("HLE ", 0) == 0 ? first_callee
++				                     : !locations[i].hle.empty()        ? "near " + locations[i].hle
++				                                                        : locations[i].text);
++			}
++		}
++		stats.distinct_rips = static_cast<uint32_t>(rips.size());
++
++		std::string    top[TopLocations];
++		uint32_t       top_counts[TopLocations] = {};
++		const uint32_t top_n = TopKeys(location_keys, top, top_counts, TopLocations);
++		std::string    entry_top[1];
++		uint32_t       entry_count[1] = {};
++		if (TopKeys(entry_keys, entry_top, entry_count, 1) == 1) {
++			stats.top_emulator_entry = entry_count[0];
++		}
++
++		// The commonest guest location (it need not be the commonest location overall), and the
++		// guest span within its module.
++		std::vector<std::string> guest_keys(m_taken);
++		for (uint32_t i = 0; i < m_taken; i++) {
++			if (m_samples[i].ok && locations[i].kind == Kind::Guest) {
++				guest_keys[i] = location_keys[i];
++			}
++		}
++		std::string       guest_top[1];
++		uint32_t          guest_top_count[1] = {};
++		const GuestRange* busiest_guest      = nullptr;
++		uint32_t          busiest_sample     = m_taken;
++		if (TopKeys(guest_keys, guest_top, guest_top_count, 1) == 1) {
++			for (uint32_t i = 0; i < m_taken; i++) {
++				if (guest_keys[i] == guest_top[0]) {
++					busiest_guest  = FindGuest(resolver.Guests(), m_samples[i].rip, nullptr);
++					busiest_sample = i;
++					break;
++				}
++			}
++		}
++		if (busiest_guest != nullptr) {
++			uint64_t lo = UINT64_MAX;
++			uint64_t hi = 0;
++			for (uint32_t i = 0; i < m_taken; i++) {
++				if (m_samples[i].ok && locations[i].kind == Kind::Guest &&
++				    FindGuest(resolver.Guests(), m_samples[i].rip, nullptr) == busiest_guest) {
++					lo = std::min(lo, m_samples[i].rip);
++					hi = std::max(hi, m_samples[i].rip);
++				}
++			}
++			stats.guest_span = hi - lo;
++		} else {
++			stats.guest_span = UINT64_MAX;
++		}
++
++		std::string top_text;
++		for (uint32_t t = 0; t < top_n; t++) {
++			top_text += (t == 0 ? "" : "; ") + top[t] + " x" + std::to_string(top_counts[t]);
++		}
++		const std::string span_text =
++		    stats.guest_span == UINT64_MAX ? "n/a" : "0x" + Hex(stats.guest_span);
++		// The probe's own impact: how long the main thread was held in this burst.
++		uint64_t pauses[SamplesPerBurst] = {};
++		uint32_t paused                  = 0;
++		uint32_t already_suspended       = 0;
++		uint32_t resume_retries          = 0;
++		for (uint32_t i = 0; i < m_taken; i++) {
++			if (m_samples[i].pause_ns != 0) {
++				pauses[paused++] = m_samples[i].pause_ns;
++			}
++			already_suspended += m_samples[i].prior_suspend != 0 ? 1 : 0;
++			resume_retries +=
++			    m_samples[i].resume_attempts > 1 ? m_samples[i].resume_attempts - 1 : 0;
++		}
++		const PauseStats pause = SummarizePauses(pauses, paused);
++		const auto       us    = [](uint64_t ns) { return static_cast<double>(ns) / 1000.0; };
++		const double     pause_pct =
++            burst_us > 0 ? us(pause.total_ns) * 100.0 / static_cast<double>(burst_us) : 0.0;
++		char now[32];
++		StallProbe::LocalTime(now, sizeof(now));
++		const auto c = [&](Kind k) { return Count(stats, k); };
++		LOGF("MainSampler: campaign=%" PRIu32 " burst=%" PRIu32 "/%" PRIu32 " t=+%" PRIu32
++		     "s local_time=%s verdict=%s samples=%" PRIu32 " guest=%" PRIu32 " guest_stub=%" PRIu32
++		     " emulator=%" PRIu32 " os_wait=%" PRIu32 " os_yield=%" PRIu32 " host_other=%" PRIu32
++		     " unknown=%" PRIu32 " failed=%" PRIu32 " distinct_rips=%" PRIu32
++		     " guest_span=%s cpu_pct=%.1f cpu_window_ms=%" PRIu64
++		     " burst_cycles_per_us=%.0f burst_ms=%.1f pauses=%" PRIu32 " pause_us_min=%.1f"
++		     " pause_us_median=%.1f pause_us_max=%.1f pause_us_total=%.1f pause_pct_of_burst=%.3f"
++		     " already_suspended=%" PRIu32 " resume_retries=%" PRIu32
++		     " emulator_entry=[%s x%" PRIu32 "] top=[%s]\n",
++		     r.campaign, b + 1, BurstCount, BurstOffsetsS[b], now, Verdict(stats), stats.samples,
++		     c(Kind::Guest), c(Kind::GuestStub), c(Kind::Emulator), c(Kind::OsWait),
++		     c(Kind::OsYield), c(Kind::HostOther), c(Kind::Unknown), c(Kind::Failed),
++		     stats.distinct_rips, span_text.c_str(), stats.cpu_pct, cpu_window_ms, cycles_per_us,
++		     static_cast<double>(burst_us) / 1000.0, pause.count, us(pause.min_ns),
++		     us(pause.median_ns), us(pause.max_ns), us(pause.total_ns), pause_pct,
++		     already_suspended, resume_retries, entry_count[0] != 0 ? entry_top[0].c_str() : "none",
++		     entry_count[0], top_text.c_str());
++
++		for (uint32_t i = 0, printed = 0; i < m_taken && printed < PrintedSamplesPerBurst; i++) {
++			const RawSample& s = m_samples[i];
++			printed++;
++			if (!s.ok) {
++				LOGF("MainSampler: campaign=%" PRIu32 " burst=%" PRIu32 " sample=%" PRIu32
++				     " t=+%.3fs failed error=%" PRIu32 "\n",
++				     r.campaign, b + 1, i, static_cast<double>(s.t_us) / 1e6, s.error);
++				continue;
++			}
++			LOGF("MainSampler: campaign=%" PRIu32 " burst=%" PRIu32 " sample=%" PRIu32
++			     " t=+%.3fs paused_us=%.1f rip=0x%016" PRIx64 " %s rsp=0x%016" PRIx64
++			     " callers=[%s]\n",
++			     r.campaign, b + 1, i, static_cast<double>(s.t_us) / 1e6, us(s.pause_ns), s.rip,
++			     locations[i].text.c_str(), s.gpr[4],
++			     caller_text[i].empty() ? "none found" : caller_text[i].c_str());
++		}
++
++		// The code around the busiest guest address, when that changes.
++		if (busiest_sample < m_taken && guest_top[0] != *prev_guest_top) {
++			*prev_guest_top = guest_top[0];
++			if (CodeBytesEnabled()) {
++				uint8_t        code[CodeBytesBefore + CodeBytesAfter] = {};
++				const uint64_t from = m_samples[busiest_sample].rip - CodeBytesBefore;
++				std::string    hex;
++				if (SafeRead(from, code, sizeof(code))) {
++					for (uint32_t i = 0; i < sizeof(code); i++) {
++						hex +=
++						    (i == 0 ? "" : (i == CodeBytesBefore ? " | " : " ")) + Hex(code[i], 2);
++					}
++				} else {
++					hex = "unreadable";
++				}
++				LOGF("MainSampler: campaign=%" PRIu32 " burst=%" PRIu32 " code %s x%" PRIu32
++				     " from 0x%016" PRIx64 " (%" PRIu32
++				     " bytes, then | at the sampled address, then %" PRIu32 "): %s\n",
++				     r.campaign, b + 1, guest_top[0].c_str(), guest_top_count[0], from,
++				     CodeBytesBefore, CodeBytesAfter, hex.c_str());
++			}
++		}
++
++		// Registers and what they point at: when the busiest place changes.
++		const std::string this_top = top_n > 0 ? top[0] : std::string();
++		if (this_top.empty() || this_top == *prev_top) {
++			return;
++		}
++		*prev_top  = this_top;
++		uint32_t d = 0;
++		while (d < m_taken && !(m_samples[d].ok && location_keys[d] == this_top)) {
++			d++;
++		}
++		if (d == m_taken) {
++			return;
++		}
++		const RawSample& s = m_samples[d];
++		std::string      regs;
++		std::string      targets;
++		std::string      matches;
++		uint64_t         waits[StallProbe::RecentWaitSlots] = {};
++		const size_t     wait_count =
++		    StallProbe::RecentLongWaitAddresses(waits, StallProbe::RecentWaitSlots);
++		for (uint32_t i = 0; i < 16; i++) {
++			regs += std::string(i == 0 ? "" : " ") + RegNames[i] + "=0x" + Hex(s.gpr[i], 16);
++			if ((s.target_ok & (1u << i)) != 0) {
++				targets += std::string(targets.empty() ? "" : " ") + "[" + RegNames[i] + "]=0x" +
++				           Hex(s.target[i], 16);
++			}
++			for (size_t w = 0; w < wait_count; w++) {
++				const uint64_t diff =
++				    s.gpr[i] > waits[w] ? s.gpr[i] - waits[w] : waits[w] - s.gpr[i];
++				if (diff <= WaitAddressSlack) {
++					matches += std::string(matches.empty() ? "" : " ") + RegNames[i] +
++					           "=wait_addr_0x" + Hex(waits[w], 16) +
++					           (s.gpr[i] >= waits[w] ? "+0x" : "-0x") + Hex(diff);
++				}
++			}
++		}
++		LOGF("MainSampler: campaign=%" PRIu32 " burst=%" PRIu32 " regs sample=%" PRIu32
++		     " %s rip=0x%016" PRIx64 " rflags=0x%" PRIx64 "\n",
++		     r.campaign, b + 1, d, regs.c_str(), s.rip, s.rflags);
++		LOGF(
++		    "MainSampler: campaign=%" PRIu32 " burst=%" PRIu32 " reg_targets sample=%" PRIu32
++		    " (8 bytes at each register that points at readable memory, read while suspended) %s\n",
++		    r.campaign, b + 1, d, targets.empty() ? "none" : targets.c_str());
++		std::string recent;
++		for (size_t w = 0; w < wait_count; w++) {
++			recent += (w == 0 ? "0x" : ",0x") + Hex(waits[w], 16);
++		}
++		// A register near a watched address is a lead. None is inconclusive: the game may compute
++		// the address from a base and an offset, or keep it in memory rather than a register.
++		const std::string match_text =
++		    matches.empty()
++		        ? std::string("no_register_near=inconclusive (the address may be computed from a "
++		                      "base and an offset, or held in memory)")
++		        : "lead: " + matches;
++		LOGF("MainSampler: campaign=%" PRIu32 " burst=%" PRIu32
++		     " wait_reg_mem_match sample=%" PRIu32 " %s (recent long wait addresses: %s)\n",
++		     r.campaign, b + 1, d, match_text.c_str(),
++		     recent.empty() ? "none yet" : recent.c_str());
++	}
++
++	static std::string Hex(uint64_t value, int digits = 0) {
++		char buf[24];
++		std::snprintf(buf, sizeof(buf), "%0*" PRIx64, digits, value);
++		return buf;
++	}
++
++	struct ResumeFailure {
++		bool     failed   = false;
++		uint32_t sample   = 0;
++		uint32_t attempts = 0;
++		uint32_t error    = 0;
++	};
++
++	std::vector<RawSample> m_samples;
++	uint32_t               m_taken = 0; // samples attempted in the last burst
++	ResumeFailure          m_resume_failure;
++	uint64_t               m_qpc_frequency = 1;
++	FunctionList           m_hle;
++#else
++	void RunCampaign(const Request& r) {
++		static bool told = false;
++		if (!std::exchange(told, true)) {
++			LOGF("MainSampler: campaign=%" PRIu32 " trigger=join:%s: sampling another thread is "
++			     "implemented on Windows only; nothing sampled\n",
++			     r.campaign, r.joined);
++		}
++	}
++#endif
++
++	std::mutex              m_mutex;
++	std::condition_variable m_wake;
++	bool                    m_stop        = false;
++	bool                    m_has_request = false;
++	bool                    m_cap_told    = false;
++	bool                    m_disabled = false; // after a ResumeThread failure, for the whole run
++	bool                    m_disabled_told = false;
++	uint32_t                m_campaigns     = 0;
++	Request                 m_request;
++	std::thread             m_thread;
++};
++
++} // namespace
++
++void NoteJoin(const char* joined_name, int joiner_id, uint64_t main_host_tid, int main_id) {
++	if (joined_name == nullptr || !StallProbe::Enabled() ||
++	    std::strcmp(joined_name, JoinName()) != 0) {
++		return;
++	}
++	Request request;
++	request.main_host_tid = main_host_tid;
++	request.main_id       = main_id;
++	request.joiner_id     = joiner_id;
++	std::snprintf(request.joined, sizeof(request.joined), "%s", joined_name);
++	StallProbe::LocalTime(request.local_time, sizeof(request.local_time));
++	if (main_host_tid == 0) {
++		LOGF("MainSampler: join of %s at %s: main thread unknown; not sampled\n", request.joined,
++		     request.local_time);
++		return;
++	}
++	Sampler::Instance().Submit(request);
++}
++
++} // namespace Libs::MainThreadSampler
+diff --git a/src/kernel/mainThreadSampler.h b/src/kernel/mainThreadSampler.h
+new file mode 100644
+index 00000000..bcf6be92
+--- /dev/null
++++ b/src/kernel/mainThreadSampler.h
+@@ -0,0 +1,535 @@
++#ifndef KERNEL_MAIN_THREAD_SAMPLER_H_
++#define KERNEL_MAIN_THREAD_SAMPLER_H_
++
++// Where the guest main thread is executing after a named thread is joined. Diagnostic only.
++//
++// Each successful join of a thread named KYTY_STALL_PROBE_JOIN (default "GameState") starts a
++// sampling campaign of the guest main thread, run from a thread of its own. A campaign is a
++// fixed series of bursts (BurstOffsetsS after the join); each burst briefly suspends the main
++// thread SamplesPerBurst times, SampleIntervalMs apart, and for each sample copies its
++// registers and the top StackBytes of its stack, then resumes it at once. Everything else
++// (naming addresses, decoding call sites, logging) happens after the resume, on the sampler
++// thread, so a suspended thread is never waited on and nothing is allocated or locked while it
++// is suspended.
++//
++// Every ResumeThread is checked and retried (ResumeAttempts); if the thread cannot be resumed the
++// failure is logged and sampling stops for the rest of the run. Each pause is timed, and every
++// burst line reports the pauses' minimum, median, maximum and total, so the probe's own impact can
++// be checked in the log.
++//
++// Bounds: MaxCampaigns campaigns per run; a new matching join ends the running campaign and
++// starts the next; per burst one summary line, at most PrintedSamplesPerBurst sample lines and,
++// when the busiest location changes, a register line, a register-target line and a code line.
++//
++// Windows only (SuspendThread/GetThreadContext); elsewhere it says so once and samples nothing.
++// It changes nothing in the emulator. KYTY_STALL_PROBE=0 turns it off, KYTY_STALL_PROBE_CODE=0
++// leaves out the code bytes (a few instructions of the game around the busiest address).
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace Libs::MainThreadSampler {
++
++// Called by PthreadJoin after a successful join, on the joining thread, before the joined
++// thread's handle can be reused. Returns at once.
++void NoteJoin(const char* joined_name, int joiner_id, uint64_t main_host_tid, int main_id);
++
++namespace Detail {
++
++// Burst start times, in seconds after the join.
++inline constexpr uint32_t BurstOffsetsS[]  = {0, 1, 2, 4, 8, 15, 30, 60, 120, 240, 480, 900, 1800};
++inline constexpr uint32_t BurstCount       = sizeof(BurstOffsetsS) / sizeof(BurstOffsetsS[0]);
++inline constexpr uint32_t SamplesPerBurst  = 32;
++inline constexpr uint32_t SampleIntervalMs = 5;
++inline constexpr uint32_t PrintedSamplesPerBurst = 8;
++inline constexpr uint32_t MaxCampaigns           = 6;
++inline constexpr uint32_t StackBytes             = 4096;
++inline constexpr uint32_t MaxCallers             = 3;
++inline constexpr uint32_t TopLocations           = 5;
++inline constexpr uint32_t CodeBytesBefore        = 16;
++inline constexpr uint32_t CodeBytesAfter         = 32;
++// A register "matches" a long wait_reg_mem address when it is this close to it. A match is a lead;
++// no match is inconclusive (the game may compute the address from a base and an offset, or keep
++// it in memory rather than in a register).
++inline constexpr uint64_t WaitAddressSlack = 0x100;
++// ResumeThread calls before the sampler gives up on resuming a sample and stops sampling.
++inline constexpr uint32_t ResumeAttempts = 4;
++
++// Where one sample's instruction pointer is.
++enum class Kind : uint8_t {
++	Guest,     // inside a loaded guest module's segments
++	GuestStub, // inside a guest module's mapping but past its segments: instruction
++	           // trampolines or the TLS handler the emulator generated
++	Emulator,  // the emulator's own executable (HLE functions and everything else in it)
++	OsWait,    // a system call stub that blocks: a wait, a sleep, a message wait
++	OsYield,   // NtYieldExecution: gives up the CPU but stays runnable
++	HostOther, // any other host module: system DLLs, the C runtime, the GPU driver
++	Unknown,   // none of the above (anonymous memory, unmapped)
++	Failed,    // the sample itself failed
++};
++inline constexpr uint32_t KindCount = 8;
++
++inline const char* KindName(Kind kind) {
++	switch (kind) {
++		case Kind::Guest: return "guest";
++		case Kind::GuestStub: return "guest_stub";
++		case Kind::Emulator: return "emulator";
++		case Kind::OsWait: return "os_wait";
++		case Kind::OsYield: return "os_yield";
++		case Kind::HostOther: return "host_other";
++		case Kind::Unknown: return "unknown";
++		case Kind::Failed: return "failed";
++	}
++	return "?";
++}
++
++inline bool EqualsIgnoreCase(const char* a, const char* b) {
++	for (; *a != '\0' && *b != '\0'; a++, b++) {
++		const char ca = (*a >= 'A' && *a <= 'Z') ? static_cast<char>(*a - 'A' + 'a') : *a;
++		const char cb = (*b >= 'A' && *b <= 'Z') ? static_cast<char>(*b - 'A' + 'a') : *b;
++		if (ca != cb) {
++			return false;
++		}
++	}
++	return *a == *b;
++}
++
++// A host instruction pointer, by module and the nearest export at or below it. A blocked
++// thread's instruction pointer sits just after the `syscall` in one of these exported stubs,
++// so the name is exact there; elsewhere the nearest export is only a landmark.
++inline Kind ClassifyHost(bool is_emulator_module, const char* module_name,
++                         const char* export_name) {
++	if (is_emulator_module) {
++		return Kind::Emulator;
++	}
++	const bool ntdll  = module_name != nullptr && EqualsIgnoreCase(module_name, "ntdll.dll");
++	const bool win32u = module_name != nullptr && EqualsIgnoreCase(module_name, "win32u.dll");
++	if ((ntdll || win32u) && export_name != nullptr &&
++	    (std::strncmp(export_name, "Nt", 2) == 0 || std::strncmp(export_name, "Zw", 2) == 0)) {
++		const char* rest = export_name + 2;
++		if (std::strcmp(rest, "YieldExecution") == 0) {
++			return Kind::OsYield;
++		}
++		static constexpr const char* WaitPrefixes[] = {
++		    "WaitFor",        // WaitForSingleObject, ...MultipleObjects, ...AlertByThreadId,
++		                      // ...KeyedEvent, ...WorkViaWorkerFactory
++		    "DelayExecution", // Sleep
++		    "RemoveIoCompletion",
++		    "SignalAndWait",
++		    "UserMsgWaitFor",
++		    "UserGetMessage",
++		    "UserWaitMessage",
++		    "ReplyWaitReceivePort",
++		    "AlpcSendWaitReceivePort",
++		};
++		for (const char* prefix: WaitPrefixes) {
++			if (std::strncmp(rest, prefix, std::strlen(prefix)) == 0) {
++				return Kind::OsWait;
++			}
++		}
++	}
++	return Kind::HostOther;
++}
++
++// --- Call sites --------------------------------------------------------------------------
++
++enum class CallForm : uint8_t {
++	None,        // the bytes before the address are not a call: not a return address
++	Rel32,       // E8 rel32: `value` is the call target
++	RipIndirect, // FF 15 disp32 (call [rip+disp]): `value` is the address of the pointer
++	Indirect,    // call through a register or other memory operand: target unknown
++};
++
++struct CallSite {
++	CallForm form  = CallForm::None;
++	uint64_t value = 0;
++};
++
++inline int32_t ReadI32(const uint8_t* p) {
++	uint32_t v = 0;
++	std::memcpy(&v, p, sizeof(v));
++	return static_cast<int32_t>(v);
++}
++
++// `before` holds the 7 bytes that end at `ret` (before[6] is the byte at ret - 1). Says whether
++// they end with a call instruction, so that `ret` would be its return address.
++inline CallSite DecodeCallBefore(const uint8_t before[7], uint64_t ret) {
++	CallSite site;
++	if (before[2] == 0xE8) { // E8 rel32
++		site.form  = CallForm::Rel32;
++		site.value = ret + static_cast<uint64_t>(static_cast<int64_t>(ReadI32(before + 3)));
++		return site;
++	}
++	if (before[1] == 0xFF && before[2] == 0x15) { // FF 15 disp32
++		site.form  = CallForm::RipIndirect;
++		site.value = ret + static_cast<uint64_t>(static_cast<int64_t>(ReadI32(before + 3)));
++		return site;
++	}
++	// FF /2 with other operands. ModRM reg field 2 = call.
++	const auto is_call_modrm = [](uint8_t modrm, uint8_t mod) {
++		return (modrm >> 6u) == mod && ((modrm >> 3u) & 7u) == 2u;
++	};
++	const bool reg  = before[5] == 0xFF && is_call_modrm(before[6], 3); // FF D0+r
++	const bool ind0 = before[5] == 0xFF && is_call_modrm(before[6], 0) && (before[6] & 7u) != 4u &&
++	                  (before[6] & 7u) != 5u; // FF 10+r
++	const bool sib0 = before[4] == 0xFF && is_call_modrm(before[5], 0) && (before[5] & 7u) == 4u &&
++	                  (before[6] & 7u) != 5u; // FF 14 sib
++	const bool d8 =
++	    before[4] == 0xFF && is_call_modrm(before[5], 1) && (before[5] & 7u) != 4u; // FF 50+r d8
++	const bool sib8 =
++	    before[3] == 0xFF && is_call_modrm(before[4], 1) && (before[4] & 7u) == 4u; // FF 54 sib d8
++	const bool d32 =
++	    before[1] == 0xFF && is_call_modrm(before[2], 2) && (before[2] & 7u) != 4u; // FF 90+r d32
++	const bool sib32 =
++	    before[0] == 0xFF && is_call_modrm(before[1], 2) && (before[1] & 7u) == 4u; // FF 94 sib d32
++	if (reg || ind0 || sib0 || d8 || sib8 || d32 || sib32) {
++		site.form = CallForm::Indirect;
++	}
++	return site;
++}
++
++// FF 25 disp32 (jmp [rip+disp]), the shape of a PLT entry. On success `*slot` is the address
++// of the pointer it jumps through.
++inline bool DecodeIndirectJump(const uint8_t stub[6], uint64_t stub_addr, uint64_t* slot) {
++	if (stub[0] != 0xFF || stub[1] != 0x25) {
++		return false;
++	}
++	*slot = stub_addr + 6 + static_cast<uint64_t>(static_cast<int64_t>(ReadI32(stub + 2)));
++	return true;
++}
++
++// --- Guest modules -----------------------------------------------------------------------
++
++struct GuestRange {
++	std::string name;
++	uint64_t    base       = 0;
++	uint64_t    image_end  = 0; // base + segments
++	uint64_t    mapped_end = 0; // base + whole mapping
++};
++
++inline const GuestRange* FindGuest(const std::vector<GuestRange>& ranges, uint64_t addr,
++                                   bool* stub) {
++	for (const auto& range: ranges) {
++		if (addr >= range.base && addr < range.mapped_end) {
++			if (stub != nullptr) {
++				*stub = addr >= range.image_end;
++			}
++			return &range;
++		}
++	}
++	return nullptr;
++}
++
++// Stack words that are return addresses into guest code: a value inside a guest module whose
++// preceding bytes are a call instruction. Found in stack order (innermost first). `read` is
++// bool(uint64_t addr, void* out, size_t size) and must fail safely on unreadable memory.
++template <typename ReadFn>
++uint32_t ScanGuestReturnAddresses(const uint8_t* stack, size_t stack_bytes,
++                                  const std::vector<GuestRange>& guests, ReadFn read,
++                                  uint64_t* rets, CallSite* sites, uint32_t capacity) {
++	uint32_t found = 0;
++	for (size_t offset = 0; offset + 8 <= stack_bytes && found < capacity; offset += 8) {
++		uint64_t value = 0;
++		std::memcpy(&value, stack + offset, sizeof(value));
++		bool stub = false;
++		if (value < 8 || FindGuest(guests, value, &stub) == nullptr || stub) {
++			continue;
++		}
++		uint8_t before[7] = {};
++		if (!read(value - 7, before, sizeof(before))) {
++			continue;
++		}
++		const CallSite site = DecodeCallBefore(before, value);
++		if (site.form == CallForm::None) {
++			continue;
++		}
++		rets[found]  = value;
++		sites[found] = site;
++		found++;
++	}
++	return found;
++}
++
++// The function a call site called, where that can be read: the target of E8, followed through
++// a PLT entry; the pointer of FF 15. 0 when unknown.
++template <typename ReadFn>
++uint64_t ResolveCallee(const CallSite& site, const std::vector<GuestRange>& guests, ReadFn read) {
++	switch (site.form) {
++		case CallForm::Rel32: {
++			uint8_t  stub[6] = {};
++			uint64_t slot    = 0;
++			uint64_t dest    = 0;
++			if (FindGuest(guests, site.value, nullptr) != nullptr &&
++			    read(site.value, stub, sizeof(stub)) &&
++			    DecodeIndirectJump(stub, site.value, &slot) && read(slot, &dest, sizeof(dest))) {
++				return dest;
++			}
++			return site.value;
++		}
++		case CallForm::RipIndirect: {
++			uint64_t dest = 0;
++			return read(site.value, &dest, sizeof(dest)) ? dest : 0;
++		}
++		case CallForm::None:
++		case CallForm::Indirect: break;
++	}
++	return 0;
++}
++
++// --- Host modules ------------------------------------------------------------------------
++
++// The nearest named export at or below `rva` in a PE32+ image laid out as loaded, reading at
++// most `image_size` bytes from `image`. Forwarders are skipped. nullptr if none.
++inline const char* NearestExport(const uint8_t* image, uint32_t image_size, uint32_t rva,
++                                 uint32_t* export_rva) {
++	const auto u16 = [&](uint32_t at, uint16_t* out) {
++		if (at > image_size || image_size - at < 2) {
++			return false;
++		}
++		std::memcpy(out, image + at, 2);
++		return true;
++	};
++	const auto u32 = [&](uint32_t at, uint32_t* out) {
++		if (at > image_size || image_size - at < 4) {
++			return false;
++		}
++		std::memcpy(out, image + at, 4);
++		return true;
++	};
++	uint16_t mz     = 0;
++	uint32_t lfanew = 0;
++	uint32_t pe     = 0;
++	uint16_t magic  = 0;
++	if (!u16(0, &mz) || mz != 0x5A4D || !u32(0x3C, &lfanew) || !u32(lfanew, &pe) ||
++	    pe != 0x00004550 || !u16(lfanew + 24, &magic) || magic != 0x20B) {
++		return nullptr;
++	}
++	const uint32_t optional  = lfanew + 24;
++	uint32_t       dir_count = 0;
++	uint32_t       dir_rva   = 0;
++	uint32_t       dir_size  = 0;
++	if (!u32(optional + 108, &dir_count) || dir_count < 1 || !u32(optional + 112, &dir_rva) ||
++	    !u32(optional + 116, &dir_size) || dir_rva == 0) {
++		return nullptr;
++	}
++	uint32_t functions      = 0;
++	uint32_t names          = 0;
++	uint32_t ordinals       = 0;
++	uint32_t function_count = 0;
++	uint32_t name_count     = 0;
++	if (!u32(dir_rva + 20, &function_count) || !u32(dir_rva + 24, &name_count) ||
++	    !u32(dir_rva + 28, &functions) || !u32(dir_rva + 32, &names) ||
++	    !u32(dir_rva + 36, &ordinals)) {
++		return nullptr;
++	}
++	const char* best_name = nullptr;
++	uint32_t    best_rva  = 0;
++	for (uint32_t i = 0; i < name_count; i++) {
++		uint16_t ordinal  = 0;
++		uint32_t name_rva = 0;
++		uint32_t func_rva = 0;
++		if (!u16(ordinals + i * 2, &ordinal) || ordinal >= function_count ||
++		    !u32(names + i * 4, &name_rva) || !u32(functions + ordinal * 4u, &func_rva)) {
++			return best_name;
++		}
++		const bool forwarder = func_rva >= dir_rva && func_rva < dir_rva + dir_size;
++		if (forwarder || func_rva > rva || (best_name != nullptr && func_rva <= best_rva) ||
++		    name_rva >= image_size) {
++			continue;
++		}
++		// The name must end inside the image.
++		const void* end = std::memchr(image + name_rva, '\0', image_size - name_rva);
++		if (end == nullptr) {
++			continue;
++		}
++		best_name = reinterpret_cast<const char*>(image + name_rva);
++		best_rva  = func_rva;
++	}
++	if (best_name != nullptr && export_rva != nullptr) {
++		*export_rva = best_rva;
++	}
++	return best_name;
++}
++
++// SizeOfImage from a PE32+ header, reading at most `limit` bytes. 0 if not a PE32+ image.
++inline uint32_t PeImageSize(const uint8_t* image, uint32_t limit) {
++	uint32_t lfanew = 0;
++	uint32_t size   = 0;
++	uint16_t magic  = 0;
++	if (limit < 0x40 || image[0] != 'M' || image[1] != 'Z') {
++		return 0;
++	}
++	std::memcpy(&lfanew, image + 0x3C, 4);
++	if (lfanew > limit || limit - lfanew < 24 + 60) {
++		return 0;
++	}
++	std::memcpy(&magic, image + lfanew + 24, 2);
++	if (std::memcmp(image + lfanew, "PE\0\0", 4) != 0 || magic != 0x20B) {
++		return 0;
++	}
++	std::memcpy(&size, image + lfanew + 24 + 56, 4);
++	return size;
++}
++
++// --- HLE functions -----------------------------------------------------------------------
++
++using FunctionList = std::vector<std::pair<uint64_t, std::string>>; // sorted by address
++
++// The function starting at or below `addr`, or nullptr. Only a landmark unless the offset is
++// 0: code that is not an HLE function sits between them.
++inline const std::pair<uint64_t, std::string>* NearestFunction(const FunctionList& sorted,
++                                                               uint64_t            addr) {
++	auto it = std::upper_bound(sorted.begin(), sorted.end(), addr,
++	                           [](uint64_t a, const auto& entry) { return a < entry.first; });
++	if (it == sorted.begin()) {
++		return nullptr;
++	}
++	return &*(it - 1);
++}
++
++// --- Suspension --------------------------------------------------------------------------
++
++struct ResumeOutcome {
++	bool     resumed        = false;
++	uint32_t attempts       = 0; // calls made
++	uint32_t previous_count = 0; // on success: the suspend count before the call (1 = only ours)
++	uint32_t error          = 0; // on failure: the last error
++};
++
++// Calls `resume` until it succeeds or `attempts` calls have failed. `resume` is
++// uint32_t(uint32_t* error): the previous suspend count, or UINT32_MAX with *error set. Retrying is
++// safe: a failed ResumeThread leaves the suspend count unchanged, so a later success resumes the
++// thread exactly once.
++template <typename ResumeFn>
++ResumeOutcome ResumeWithRetry(ResumeFn resume, uint32_t attempts) {
++	ResumeOutcome outcome;
++	while (outcome.attempts < attempts) {
++		outcome.attempts++;
++		uint32_t       error    = 0;
++		const uint32_t previous = resume(&error);
++		if (previous != UINT32_MAX) {
++			outcome.resumed        = true;
++			outcome.previous_count = previous;
++			outcome.error          = 0;
++			return outcome;
++		}
++		outcome.error = error;
++	}
++	return outcome;
++}
++
++// How long the main thread was held, from just before SuspendThread to just after ResumeThread
++// returned: an upper bound on each pause the sampler caused.
++struct PauseStats {
++	uint32_t count     = 0;
++	uint64_t min_ns    = 0;
++	uint64_t median_ns = 0; // upper median for an even count
++	uint64_t max_ns    = 0;
++	uint64_t total_ns  = 0;
++};
++
++inline PauseStats SummarizePauses(const uint64_t* pauses_ns, size_t count) {
++	PauseStats stats;
++	if (count == 0) {
++		return stats;
++	}
++	std::vector<uint64_t> sorted(pauses_ns, pauses_ns + count);
++	std::sort(sorted.begin(), sorted.end());
++	stats.count     = static_cast<uint32_t>(count);
++	stats.min_ns    = sorted.front();
++	stats.max_ns    = sorted.back();
++	stats.median_ns = sorted[count / 2];
++	for (const uint64_t ns: sorted) {
++		stats.total_ns += ns;
++	}
++	return stats;
++}
++
++// --- Burst reading -----------------------------------------------------------------------
++
++struct BurstStats {
++	uint32_t samples            = 0; // attempted
++	uint32_t by_kind[KindCount] = {};
++	uint32_t distinct_rips      = 0;
++	uint64_t guest_span         = 0;    // max - min guest rip within the busiest guest module
++	double   cpu_pct            = -1.0; // main thread CPU time / wall time; < 0 unknown
++	uint32_t top_emulator_entry = 0; // host samples whose emulator entry point is the commonest one
++	uint32_t host_samples       = 0; // emulator + os_wait + os_yield + host_other
++};
++
++inline uint32_t Count(const BurstStats& s, Kind k) {
++	return s.by_kind[static_cast<uint32_t>(k)];
++}
++
++// A one-word reading of a burst; the sample lines are the evidence. Rules, in order:
++//   no_samples           nothing could be sampled
++//   waiting              >= 80% in a blocking system call and CPU < 25%
++//   waiting_cpu_unknown  >= 80% in a blocking system call, CPU time unavailable
++//   guest_spin           >= 90% in guest code within 4 KiB of one place, CPU >= 50% or unknown
++//   polling_emulator     >= 10% guest, >= 10% inside emulator calls, one emulator entry point
++//                        in >= 50% of those, CPU >= 50% or unknown
++//   busy_in_emulator     >= 80% inside emulator calls (a wait call included: many short waits
++//                        that still use the CPU), CPU >= 50% or unknown
++//   varied               anything else: many different places, which is what progress looks like
++inline const char* Verdict(const BurstStats& s) {
++	const uint32_t ok = s.samples - Count(s, Kind::Failed);
++	if (ok == 0) {
++		return "no_samples";
++	}
++	const auto at_least = [&](uint32_t part, uint32_t whole, uint32_t pct) {
++		return whole != 0 && part * 100u >= whole * pct;
++	};
++	const bool     cpu_busy = s.cpu_pct < 0.0 || s.cpu_pct >= 50.0;
++	const uint32_t guest    = Count(s, Kind::Guest) + Count(s, Kind::GuestStub);
++	if (at_least(Count(s, Kind::OsWait), ok, 80) && s.cpu_pct < 25.0) {
++		return s.cpu_pct < 0.0 ? "waiting_cpu_unknown" : "waiting";
++	}
++	if (at_least(guest, ok, 90) && s.guest_span <= 4096 && cpu_busy) {
++		return "guest_spin";
++	}
++	if (at_least(guest, ok, 10) && at_least(s.host_samples, ok, 10) &&
++	    at_least(s.top_emulator_entry, s.host_samples, 50) && cpu_busy) {
++		return "polling_emulator";
++	}
++	if (at_least(s.host_samples, ok, 80) && cpu_busy) {
++		return "busy_in_emulator";
++	}
++	return "varied";
++}
++
++// Commonest keys first; ties keep first-seen order. Returns how many entries were filled.
++inline uint32_t TopKeys(const std::vector<std::string>& keys, std::string* top, uint32_t* counts,
++                        uint32_t capacity) {
++	std::vector<std::pair<std::string, uint32_t>> tally;
++	for (const auto& key: keys) {
++		if (key.empty()) {
++			continue;
++		}
++		auto it = std::find_if(tally.begin(), tally.end(),
++		                       [&](const auto& entry) { return entry.first == key; });
++		if (it == tally.end()) {
++			tally.emplace_back(key, 1);
++		} else {
++			it->second++;
++		}
++	}
++	std::stable_sort(tally.begin(), tally.end(),
++	                 [](const auto& a, const auto& b) { return a.second > b.second; });
++	uint32_t n = 0;
++	for (; n < capacity && n < tally.size(); n++) {
++		top[n]    = tally[n].first;
++		counts[n] = tally[n].second;
++	}
++	return n;
++}
++
++} // namespace Detail
++
++} // namespace Libs::MainThreadSampler
++
++#endif // KERNEL_MAIN_THREAD_SAMPLER_H_
+diff --git a/src/kernel/pthread.cpp b/src/kernel/pthread.cpp
+index 958d8a34..10c1643b 100644
+--- a/src/kernel/pthread.cpp
++++ b/src/kernel/pthread.cpp
+@@ -10,6 +10,7 @@
+ #include "common/stringUtils.h"
+ #include "common/threads.h"
+ #include "common/timer.h"
++#include "kernel/mainThreadSampler.h"
+ #include "kernel/memory.h"
+ #include "libs/errno.h"
+ #include "libs/libs.h"
+@@ -3369,6 +3370,13 @@ int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
+ 	}
+ 
+ 	if (result == 0) {
++		// Diagnostic only: may start sampling the main thread (mainThreadSampler.h). Before the
++		// thread is marked free, while its name cannot be reused.
++		if (g_pthread_main != nullptr) {
++			MainThreadSampler::NoteJoin(thread->name.c_str(), Common::Thread::GetThreadIdUnique(),
++			                            g_pthread_main->host_thread_id, g_pthread_main->unique_id);
++		}
++
+ 		FreeGuestStack(thread->attr);
+ 
+ 		thread->almost_done = false;
+diff --git a/src/kernel/stallProbe.h b/src/kernel/stallProbe.h
+new file mode 100644
+index 00000000..26c99c0c
+--- /dev/null
++++ b/src/kernel/stallProbe.h
+@@ -0,0 +1,117 @@
++#ifndef KERNEL_STALL_PROBE_H_
++#define KERNEL_STALL_PROBE_H_
++
++// Pieces shared by the two halves of the stall probe: the switch, a clock, and the addresses of
++// recent long WAIT_REG_MEM waits, which the main-thread sampler compares its registers with.
++//
++// Diagnostic only. Nothing here changes what the emulator does.
++// KYTY_STALL_PROBE=0 turns the whole probe off: the wait_reg_mem detail lines and the
++// main-thread sampler. Unset or any other value leaves it on.
++
++#include <atomic>
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++
++namespace Libs::StallProbe {
++
++inline constexpr size_t RecentWaitSlots = 8;
++
++namespace Detail {
++
++// -1 = not read yet, 0 = off, 1 = on.
++inline std::atomic<int> g_enabled {-1};
++
++inline std::atomic<uint64_t> g_recent_wait_addrs[RecentWaitSlots] {};
++inline std::atomic<uint32_t> g_recent_wait_next {0};
++
++} // namespace Detail
++
++[[nodiscard]] inline bool Enabled() {
++	int state = Detail::g_enabled.load(std::memory_order_relaxed);
++	if (state < 0) {
++		const char* value = std::getenv("KYTY_STALL_PROBE");
++		state             = (value == nullptr || std::strcmp(value, "0") != 0) ? 1 : 0;
++		// Every thread derives the same value from the same environment.
++		Detail::g_enabled.store(state, std::memory_order_relaxed);
++	}
++	return state != 0;
++}
++
++// Tests only.
++inline void SetEnabledForTest(bool enabled) {
++	Detail::g_enabled.store(enabled ? 1 : 0, std::memory_order_relaxed);
++}
++inline void ResetEnabledForTest() {
++	Detail::g_enabled.store(-1, std::memory_order_relaxed);
++}
++
++inline uint64_t NowUs() {
++	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
++	                                 std::chrono::steady_clock::now().time_since_epoch())
++	                                 .count());
++}
++
++// Called once per long wait, when it becomes long.
++inline void PublishLongWaitAddress(uint64_t addr) {
++	const uint32_t slot =
++	    Detail::g_recent_wait_next.fetch_add(1, std::memory_order_relaxed) % RecentWaitSlots;
++	Detail::g_recent_wait_addrs[slot].store(addr, std::memory_order_relaxed);
++}
++
++// The distinct addresses published so far (the last RecentWaitSlots long waits), in no order.
++inline size_t RecentLongWaitAddresses(uint64_t* out, size_t capacity) {
++	size_t count = 0;
++	for (size_t i = 0; i < RecentWaitSlots && count < capacity; i++) {
++		const uint64_t addr = Detail::g_recent_wait_addrs[i].load(std::memory_order_relaxed);
++		if (addr == 0) {
++			continue;
++		}
++		bool seen = false;
++		for (size_t j = 0; j < count; j++) {
++			seen = seen || out[j] == addr;
++		}
++		if (!seen) {
++			out[count++] = addr;
++		}
++	}
++	return count;
++}
++
++inline void ClearRecentForTest() {
++	for (auto& slot: Detail::g_recent_wait_addrs) {
++		slot.store(0, std::memory_order_relaxed);
++	}
++	Detail::g_recent_wait_next.store(0, std::memory_order_relaxed);
++}
++
++// Wall-clock time as "YYYY-MM-DD HH:MM:SS.mmm", to line up with the external monitors' CSVs.
++inline void LocalTime(char* out, size_t size) {
++	std::snprintf(out, size, "unknown");
++	const auto wall   = std::chrono::system_clock::now();
++	const auto wall_t = std::chrono::system_clock::to_time_t(wall);
++	const auto wall_ms =
++	    std::chrono::duration_cast<std::chrono::milliseconds>(wall.time_since_epoch()).count() %
++	    1000;
++	std::tm tm {};
++#ifdef _WIN32
++	if (localtime_s(&tm, &wall_t) != 0) {
++		return;
++	}
++#else
++	if (localtime_r(&wall_t, &tm) == nullptr) {
++		return;
++	}
++#endif
++	char hms[24] = {};
++	std::strftime(hms, sizeof(hms), "%Y-%m-%d %H:%M:%S", &tm);
++	std::snprintf(out, size, "%s.%03d", hms, static_cast<int>(wall_ms));
++}
++
++} // namespace Libs::StallProbe
++
++#endif // KERNEL_STALL_PROBE_H_
+diff --git a/src/loader/runtimeLinker.cpp b/src/loader/runtimeLinker.cpp
+index 10557aec..7ae0b3df 100644
+--- a/src/loader/runtimeLinker.cpp
++++ b/src/loader/runtimeLinker.cpp
+@@ -1513,6 +1513,28 @@ Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {
+ 	return nullptr;
+ }
+ 
++std::vector<ProgramRange> RuntimeLinker::SnapshotProgramRanges() {
++	Common::LockGuard lock(m_mutex);
++
++	std::vector<ProgramRange> ranges;
++	ranges.reserve(m_programs.size());
++	for (const auto* p: m_programs) {
++		ranges.push_back({Common::FilenameWithoutDirectory(Common::PathToGenericString(p->file_name)),
++		                  p->base_vaddr, p->base_size_aligned, p->mapped_size});
++	}
++	return ranges;
++}
++
++std::vector<std::pair<uint64_t, std::string>> RuntimeLinker::SnapshotHleFunctions() {
++	Common::LockGuard lock(m_mutex);
++
++	std::vector<std::pair<uint64_t, std::string>> functions;
++	if (m_symbols != nullptr) {
++		m_symbols->CopyFunctions(&functions);
++	}
++	return functions;
++}
++
+ void RuntimeLinker::StackTrace(uint64_t frame_ptr, uint64_t stack_ptr) {
+ 	void* stack[20];
+ 	int   depth = WalkGuestStack(frame_ptr, stack_ptr, stack, static_cast<int>(std::size(stack)));
+diff --git a/src/loader/runtimeLinker.h b/src/loader/runtimeLinker.h
+index f79cb50f..2c759ae2 100644
+--- a/src/loader/runtimeLinker.h
++++ b/src/loader/runtimeLinker.h
+@@ -114,6 +114,14 @@ struct DynamicInfo {
+ 	std::vector<LibraryId> import_libs;
+ };
+ 
++// Diagnostics only: where a loaded program sits in memory, copied under the linker's lock.
++struct ProgramRange {
++	std::string file_name;         // without directory
++	uint64_t    base_vaddr        = 0;
++	uint64_t    base_size_aligned = 0; // the ELF segments
++	uint64_t    mapped_size       = 0; // segments plus the TLS handler and instruction trampolines
++};
++
+ struct Program {
+ 	Program();
+ 	~Program();
+@@ -177,6 +185,11 @@ public:
+ 	Program*        FindProgramByAddr(uint64_t vaddr);
+ 	Program*        FindProgramById(int32_t id);
+ 	Program*        FindProgramByFileName(const std::filesystem::path& elf_name);
++	// Diagnostics only: a copy of every loaded program's range, so the caller never holds a
++	// Program that another thread may unload.
++	std::vector<ProgramRange> SnapshotProgramRanges();
++	// Diagnostics only: (address, debug name) of every HLE function, copied under the lock.
++	std::vector<std::pair<uint64_t, std::string>> SnapshotHleFunctions();
+ 
+ 	static uint8_t* TlsGetAddr(Program* program);
+ 	static void     DeleteTls(Program* program, int thread_id);
+diff --git a/src/loader/symbolDatabase.cpp b/src/loader/symbolDatabase.cpp
+index 992e43f9..302fbf94 100644
+--- a/src/loader/symbolDatabase.cpp
++++ b/src/loader/symbolDatabase.cpp
+@@ -93,4 +93,14 @@ const SymbolRecord* SymbolDatabase::FindByName(const std::string& name, SymbolTy
+ 	return nullptr;
+ }
+ 
++void SymbolDatabase::CopyFunctions(std::vector<std::pair<uint64_t, std::string>>* out) const {
++	const auto suffix = fmt::format("[{}]", magic_enum::enum_name(SymbolType::Func));
++
++	for (const auto& symbol: m_symbols) {
++		if (symbol.name.ends_with(suffix)) {
++			out->emplace_back(symbol.vaddr, symbol.dbg_name);
++		}
++	}
++}
++
+ } // namespace Loader
+diff --git a/src/loader/symbolDatabase.h b/src/loader/symbolDatabase.h
+index bf3f64ab..d5b7ecf8 100644
+--- a/src/loader/symbolDatabase.h
++++ b/src/loader/symbolDatabase.h
+@@ -5,7 +5,9 @@
+ #include "common/common.h"
+ #include "common/stringUtils.h"
+ 
++#include <string>
+ #include <unordered_map>
++#include <utility>
+ #include <vector>
+ 
+ namespace Loader {
+@@ -46,6 +48,8 @@ public:
+ 	[[nodiscard]] const SymbolRecord* FindByNid(const std::string& nid, SymbolType type,
+ 	                                              uint64_t vaddr = 0) const;
+ 	[[nodiscard]] const SymbolRecord* FindByName(const std::string& name, SymbolType type) const;
++	// Diagnostics only: appends (address, debug name) of every function record.
++	void CopyFunctions(std::vector<std::pair<uint64_t, std::string>>* out) const;
+ 
+ 	void DbgDump(const std::string& folder, const std::string& file_name);
+ 
