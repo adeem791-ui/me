@@ -295,10 +295,10 @@ index f927f6e5..bf7acbd7 100644
  }
 diff --git a/src/kernel/mainThreadSampler.cpp b/src/kernel/mainThreadSampler.cpp
 new file mode 100644
-index 00000000..48b0f2ee
+index 00000000..9c7d997a
 --- /dev/null
 +++ b/src/kernel/mainThreadSampler.cpp
-@@ -0,0 +1,872 @@
+@@ -0,0 +1,804 @@
 +#include "kernel/mainThreadSampler.h"
 +
 +#include "common/common.h"
@@ -335,15 +335,6 @@ index 00000000..48b0f2ee
 +	const char* value = std::getenv("KYTY_STALL_PROBE_JOIN");
 +	return (value != nullptr && value[0] != '\0') ? value : "GameState";
 +}
-+
-+struct Request {
-+	uint64_t main_host_tid  = 0;
-+	int      main_id        = 0;
-+	int      joiner_id      = 0;
-+	uint32_t campaign       = 0;
-+	char     joined[64]     = {};
-+	char     local_time[32] = {};
-+};
 +
 +#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 +
@@ -580,11 +571,7 @@ index 00000000..48b0f2ee
 +public:
 +	Sampler() = default;
 +	~Sampler() {
-+		{
-+			std::lock_guard lock(m_mutex);
-+			m_stop = true;
-+		}
-+		m_wake.notify_all();
++		m_queue.Stop();
 +		if (m_thread.joinable()) {
 +			m_thread.join();
 +		}
@@ -597,76 +584,30 @@ index 00000000..48b0f2ee
 +		return sampler;
 +	}
 +
-+	void Submit(Request request) {
-+		bool over_cap      = false;
-+		bool tell_cap      = false;
-+		bool disabled_line = false;
-+		{
-+			std::lock_guard lock(m_mutex);
-+			if (m_stop) {
-+				return;
-+			}
-+			if (m_disabled) {
-+				if (!std::exchange(m_disabled_told, true)) {
-+					disabled_line = true;
-+				}
-+				over_cap = true;
-+			} else if (m_campaigns >= MaxCampaigns) {
-+				over_cap = true;
-+				tell_cap = !std::exchange(m_cap_told, true);
-+			} else {
-+				request.campaign = ++m_campaigns;
-+				m_request        = request;
-+				m_has_request    = true;
-+				if (!m_thread.joinable()) {
-+					m_thread = std::thread([this] { Run(); });
-+				}
-+			}
-+		}
-+		if (over_cap) {
-+			if (disabled_line) {
-+				LOGF("MainSampler: join of %s at %s not sampled: sampling stopped earlier in "
-+				     "this run after a ResumeThread failure\n",
-+				     request.joined, request.local_time);
-+			}
-+			if (tell_cap) {
-+				LOGF("MainSampler: join of %s at %s not sampled: %" PRIu32
-+				     " campaigns per run already used\n",
-+				     request.joined, request.local_time, MaxCampaigns);
-+			}
++	void Submit(const Request& request) {
++		const auto result = m_queue.Submit(request, [this] {
++			m_thread = std::thread(
++			    [this] { WorkerLoop(m_queue, [this](const Request& r) { RunCampaign(r); }); });
++		});
++		if (!result.first_refusal) {
 +			return;
 +		}
-+		m_wake.notify_all();
++		if (result.outcome == CampaignQueue::Outcome::Disabled) {
++			LOGF("MainSampler: join of %s at %s not sampled: sampling stopped earlier in this run "
++			     "after a ResumeThread failure\n",
++			     request.joined, request.local_time);
++		} else if (result.outcome == CampaignQueue::Outcome::CapReached) {
++			LOGF("MainSampler: join of %s at %s not sampled: %" PRIu32
++			     " campaigns per run already used\n",
++			     request.joined, request.local_time, MaxCampaigns);
++		}
 +	}
 +
 +private:
-+	void Run() {
-+		for (;;) {
-+			Request request;
-+			{
-+				std::unique_lock lock(m_mutex);
-+				m_wake.wait(lock, [this] { return m_stop || m_has_request; });
-+				if (m_stop) {
-+					return;
-+				}
-+				request       = m_request;
-+				m_has_request = false;
-+			}
-+			RunCampaign(request);
-+		}
-+	}
++	// Waits until `when`. False if shutdown, a newer join or a disable interrupts.
++	bool WaitUntil(std::chrono::steady_clock::time_point when) { return m_queue.WaitUntil(when); }
 +
-+	// Waits until `when`. False if a new campaign or shutdown interrupts.
-+	bool WaitUntil(std::chrono::steady_clock::time_point when) {
-+		std::unique_lock lock(m_mutex);
-+		m_wake.wait_until(lock, when, [this] { return m_stop || m_has_request; });
-+		return !m_stop && !m_has_request;
-+	}
-+
-+	[[nodiscard]] const char* Interruption() {
-+		std::lock_guard lock(m_mutex);
-+		return m_stop ? "stopping" : "superseded_by_next_join";
-+	}
++	[[nodiscard]] const char* Interruption() { return m_queue.Interruption(); }
 +
 +#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 +	void RunCampaign(const Request& r) {
@@ -717,17 +658,16 @@ index 00000000..48b0f2ee
 +			const auto     burst_end    = std::chrono::steady_clock::now();
 +			if (m_resume_failure.failed) {
 +				// The main thread may still be suspended, possibly holding a lock the naming code
-+				// or the logger needs, so nothing else runs: one line, then sampling stops for
-+				// the rest of the run.
-+				LOGF("MainSampler: campaign=%" PRIu32 " burst=%" PRIu32 " sample=%" PRIu32
-+				     " ResumeThread FAILED %" PRIu32 " times (last error %" PRIu32
-+				     "); the main thread may still be suspended; sampling stopped for this run\n",
-+				     r.campaign, b + 1, m_resume_failure.sample, m_resume_failure.attempts,
-+				     m_resume_failure.error);
-+				{
-+					std::lock_guard lock(m_mutex);
-+					m_disabled = true;
-+				}
++				// or the logger needs. Sampling is disabled and any queued campaign dropped first,
++				// under the queue's lock; only then is the one line logged. Nothing samples again.
++				HandleResumeExhausted(m_queue, [&](bool dropped) {
++					LOGF("MainSampler: campaign=%" PRIu32 " burst=%" PRIu32 " sample=%" PRIu32
++					     " ResumeThread FAILED %" PRIu32 " times (last error %" PRIu32
++					     "); the main thread may still be suspended; sampling stopped for this run"
++					     " (queued_campaign_dropped=%d)\n",
++					     r.campaign, b + 1, m_resume_failure.sample, m_resume_failure.attempts,
++					     m_resume_failure.error, dropped ? 1 : 0);
++				});
 +				end = "resume_failed";
 +				break;
 +			}
@@ -1137,16 +1077,8 @@ index 00000000..48b0f2ee
 +	}
 +#endif
 +
-+	std::mutex              m_mutex;
-+	std::condition_variable m_wake;
-+	bool                    m_stop        = false;
-+	bool                    m_has_request = false;
-+	bool                    m_cap_told    = false;
-+	bool                    m_disabled = false; // after a ResumeThread failure, for the whole run
-+	bool                    m_disabled_told = false;
-+	uint32_t                m_campaigns     = 0;
-+	Request                 m_request;
-+	std::thread             m_thread;
++	CampaignQueue m_queue;
++	std::thread   m_thread;
 +};
 +
 +} // namespace
@@ -1156,7 +1088,7 @@ index 00000000..48b0f2ee
 +	    std::strcmp(joined_name, JoinName()) != 0) {
 +		return;
 +	}
-+	Request request;
++	Detail::Request request;
 +	request.main_host_tid = main_host_tid;
 +	request.main_id       = main_id;
 +	request.joiner_id     = joiner_id;
@@ -1173,10 +1105,10 @@ index 00000000..48b0f2ee
 +} // namespace Libs::MainThreadSampler
 diff --git a/src/kernel/mainThreadSampler.h b/src/kernel/mainThreadSampler.h
 new file mode 100644
-index 00000000..bcf6be92
+index 00000000..bb6cf8f6
 --- /dev/null
 +++ b/src/kernel/mainThreadSampler.h
-@@ -0,0 +1,535 @@
+@@ -0,0 +1,703 @@
 +#ifndef KERNEL_MAIN_THREAD_SAMPLER_H_
 +#define KERNEL_MAIN_THREAD_SAMPLER_H_
 +
@@ -1191,8 +1123,9 @@ index 00000000..bcf6be92
 +// thread, so a suspended thread is never waited on and nothing is allocated or locked while it
 +// is suspended.
 +//
-+// Every ResumeThread is checked and retried (ResumeAttempts); if the thread cannot be resumed the
-+// failure is logged and sampling stops for the rest of the run. Each pause is timed, and every
++// Every ResumeThread is checked and retried (ResumeAttempts); if the thread cannot be resumed,
++// sampling is first disabled for the rest of the run and any queued campaign dropped, and only then
++// is the failure logged (HandleResumeExhausted). Each pause is timed, and every
 +// burst line reports the pauses' minimum, median, maximum and total, so the probe's own impact can
 +// be checked in the log.
 +//
@@ -1205,9 +1138,12 @@ index 00000000..bcf6be92
 +// leaves out the code bytes (a few instructions of the game around the busiest address).
 +
 +#include <algorithm>
++#include <chrono>
++#include <condition_variable>
 +#include <cstddef>
 +#include <cstdint>
 +#include <cstring>
++#include <mutex>
 +#include <string>
 +#include <utility>
 +#include <vector>
@@ -1705,6 +1641,170 @@ index 00000000..bcf6be92
 +		counts[n] = tally[n].second;
 +	}
 +	return n;
++}
++
++// --- Campaign queue ------------------------------------------------------------------------
++
++// One requested campaign: the join that triggered it and the thread to sample.
++struct Request {
++	uint64_t main_host_tid  = 0;
++	int      main_id        = 0;
++	int      joiner_id      = 0;
++	uint32_t campaign       = 0;
++	char     joined[64]     = {};
++	char     local_time[32] = {};
++};
++
++// The hand-off between joins (any thread) and the sampler's worker thread: at most one pending
++// request (a newer join replaces it), the campaign cap, shutdown, and the permanent stop after a
++// resume failure. Platform-independent, so the failure ordering is testable.
++class CampaignQueue {
++public:
++	enum class Outcome { Queued, Disabled, CapReached, Stopping };
++
++	struct Submitted {
++		Outcome  outcome       = Outcome::Stopping;
++		bool     first_refusal = false; // the first Disabled or CapReached refusal of the run
++		uint32_t campaign      = 0;     // when Queued
++	};
++
++	// From the joining thread. `start_worker` is called under the lock, once per run, with the
++	// first queued request.
++	template <typename StartFn>
++	Submitted Submit(Request request, StartFn start_worker) {
++		Submitted result;
++		{
++			std::lock_guard lock(m_mutex);
++			if (m_stop) {
++				result.outcome = Outcome::Stopping;
++				return result;
++			}
++			if (m_disabled) {
++				result.outcome       = Outcome::Disabled;
++				result.first_refusal = !std::exchange(m_disabled_told, true);
++				return result;
++			}
++			if (m_campaigns >= MaxCampaigns) {
++				result.outcome       = Outcome::CapReached;
++				result.first_refusal = !std::exchange(m_cap_told, true);
++				return result;
++			}
++			request.campaign = ++m_campaigns;
++			m_request        = request;
++			m_has_request    = true;
++			result.outcome   = Outcome::Queued;
++			result.campaign  = request.campaign;
++			if (!std::exchange(m_worker_started, true)) {
++				start_worker();
++			}
++		}
++		m_wake.notify_all();
++		return result;
++	}
++
++	// From the worker: the next campaign to run, or false once sampling is stopped or disabled.
++	// The disabled state is checked here, under the lock, before any campaign starts, so a request
++	// that was queued before or raced with a resume failure is dropped, never run.
++	bool Next(Request* out) {
++		std::unique_lock lock(m_mutex);
++		m_wake.wait(lock, [this] { return m_stop || m_disabled || m_has_request; });
++		if (m_stop || m_disabled) {
++			m_has_request = false;
++			return false;
++		}
++		*out          = m_request;
++		m_has_request = false;
++		return true;
++	}
++
++	// From the worker, between bursts: false if shutdown, a newer join or a disable interrupts.
++	bool WaitUntil(std::chrono::steady_clock::time_point when) {
++		std::unique_lock lock(m_mutex);
++		m_wake.wait_until(lock, when, [this] { return m_stop || m_disabled || m_has_request; });
++		return !m_stop && !m_disabled && !m_has_request;
++	}
++
++	[[nodiscard]] const char* Interruption() {
++		std::lock_guard lock(m_mutex);
++		return m_stop ? "stopping" : m_disabled ? "sampling_disabled" : "superseded_by_next_join";
++	}
++
++	// From the worker when every resume retry failed. In one step under the lock: sampling is
++	// disabled for the rest of the run and any queued campaign dropped. Takes no other lock and
++	// calls nothing else. Returns whether a queued campaign was dropped.
++	bool DisableAfterResumeFailure() {
++		bool dropped = false;
++		{
++			std::lock_guard lock(m_mutex);
++			dropped       = m_has_request;
++			m_has_request = false;
++			m_disabled    = true;
++		}
++		m_wake.notify_all();
++		return dropped;
++	}
++
++	void Stop() {
++		{
++			std::lock_guard lock(m_mutex);
++			m_stop = true;
++		}
++		m_wake.notify_all();
++	}
++
++	// Tests only.
++	bool DisabledForTest() {
++		std::lock_guard lock(m_mutex);
++		return m_disabled;
++	}
++	bool PendingForTest() {
++		std::lock_guard lock(m_mutex);
++		return m_has_request;
++	}
++	bool LockFreeForTest() {
++		if (!m_mutex.try_lock()) {
++			return false;
++		}
++		m_mutex.unlock();
++		return true;
++	}
++	// Disabled with a request still pending: a state the queue itself never produces, to check
++	// that Next() refuses on the disabled flag alone.
++	void ForceDisabledKeepingRequestForTest() {
++		std::lock_guard lock(m_mutex);
++		m_disabled = true;
++	}
++
++private:
++	std::mutex              m_mutex;
++	std::condition_variable m_wake;
++	Request                 m_request;
++	bool                    m_has_request    = false;
++	bool                    m_stop           = false;
++	bool                    m_disabled       = false; // after a resume failure, for the whole run
++	bool                    m_disabled_told  = false;
++	bool                    m_cap_told       = false;
++	bool                    m_worker_started = false;
++	uint32_t                m_campaigns      = 0;
++};
++
++// The exhausted-resume path, in the order that matters: first, under the queue's lock, sampling
++// is disabled and any queued campaign dropped; only then, with no lock held, `log(dropped)` runs.
++// If logging never returns (the suspended thread may hold the logger's lock), nothing can sample
++// again: the worker's only way back to sampling is Next(), which refuses.
++template <typename LogFn>
++void HandleResumeExhausted(CampaignQueue& queue, LogFn log) {
++	const bool dropped = queue.DisableAfterResumeFailure();
++	log(dropped);
++}
++
++// The worker thread's body: runs campaigns until the queue stops or is disabled.
++template <typename RunFn>
++void WorkerLoop(CampaignQueue& queue, RunFn run_campaign) {
++	Request request;
++	while (queue.Next(&request)) {
++		run_campaign(request);
++	}
 +}
 +
 +} // namespace Detail

@@ -5,9 +5,14 @@
 #include "kernel/mainThreadSampler.h"
 #include "kernel/stallProbe.h"
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <mutex>
+#include <thread>
 #include <random>
 #include <string>
 #include <vector>
@@ -631,6 +636,162 @@ void TestSummarizePauses() {
 	CHECK(none.count == 0 && none.total_ns == 0 && none.max_ns == 0);
 }
 
+// The review case: a GameState join is queued while a campaign's burst is failing to resume the
+// main thread. The queued campaign must be dropped, the worker must stop by itself, nothing may
+// sample the thread afterwards, and the failure is logged only after sampling is disabled, with
+// the queue's lock free.
+void TestQueuedCampaignDroppedOnResumeFailure() {
+	using namespace Sampler;
+	CampaignQueue           queue;
+	std::mutex              m;
+	std::condition_variable cv;
+	bool                    in_failing_burst = false;
+	bool                    second_queued    = false;
+	std::atomic<int>        starts {0};
+	std::atomic<int>        suspends {0};
+	std::atomic<int>        resume_calls {0};
+	std::atomic<bool>       worker_done {false};
+	std::vector<uint32_t>   campaigns_run; // written by the worker only; read after join
+	bool                    log_called         = false;
+	bool                    log_lock_free      = false;
+	bool                    log_saw_disabled   = false;
+	bool                    log_saw_no_pending = false;
+	bool                    log_dropped        = false;
+	std::thread             worker;
+
+	const auto run_campaign = [&](const Request& r) {
+		campaigns_run.push_back(r.campaign);
+		suspends++; // the sample whose resume is about to fail
+		{
+			std::unique_lock lock(m);
+			in_failing_burst = true;
+			cv.notify_all();
+			cv.wait(lock, [&] { return second_queued; });
+		}
+		const auto outcome = ResumeWithRetry(
+		    [&](uint32_t* error) -> uint32_t {
+			    resume_calls++;
+			    *error = 6; // ERROR_INVALID_HANDLE
+			    return UINT32_MAX;
+		    },
+		    ResumeAttempts);
+		CHECK(!outcome.resumed && outcome.attempts == ResumeAttempts);
+		HandleResumeExhausted(queue, [&](bool dropped) {
+			log_called    = true;
+			log_lock_free = queue.LockFreeForTest(); // first: the others take the lock
+			log_saw_disabled   = queue.DisabledForTest();
+			log_saw_no_pending = !queue.PendingForTest();
+			log_dropped        = dropped;
+		});
+	};
+	const auto start = [&] {
+		starts++;
+		worker = std::thread([&] {
+			WorkerLoop(queue, run_campaign);
+			worker_done = true;
+		});
+	};
+
+	Request join;
+	std::snprintf(join.joined, sizeof(join.joined), "GameState");
+	const auto first = queue.Submit(join, start);
+	CHECK(first.outcome == CampaignQueue::Outcome::Queued && first.campaign == 1);
+	{
+		std::unique_lock lock(m);
+		cv.wait(lock, [&] { return in_failing_burst; });
+	}
+	// A join arrives during the failing burst and is queued.
+	const auto second = queue.Submit(join, start);
+	CHECK(second.outcome == CampaignQueue::Outcome::Queued && second.campaign == 2);
+	CHECK(queue.PendingForTest());
+	{
+		std::lock_guard lock(m);
+		second_queued = true;
+	}
+	cv.notify_all();
+
+	// The worker must stop on its own; the timeout only keeps a regression from hanging the test.
+	for (int i = 0; i < 400 && !worker_done; i++) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	}
+	const bool stopped_by_itself = worker_done.load();
+	if (!stopped_by_itself) {
+		queue.Stop();
+	}
+	worker.join();
+	CHECK(stopped_by_itself);
+	CHECK(campaigns_run.size() == 1 && campaigns_run[0] == 1); // campaign 2 never ran
+	CHECK(suspends == 1);                                      // nothing sampled after the failure
+	CHECK(resume_calls == static_cast<int>(ResumeAttempts));   // retry count unchanged
+	CHECK(log_called && log_lock_free && log_saw_disabled && log_saw_no_pending && log_dropped);
+	CHECK(!queue.PendingForTest());
+
+	// Joins after the failure are refused for the rest of the run, the first one reported once,
+	// and no worker is started again.
+	const auto third = queue.Submit(join, start);
+	CHECK(third.outcome == CampaignQueue::Outcome::Disabled && third.first_refusal);
+	const auto fourth = queue.Submit(join, start);
+	CHECK(fourth.outcome == CampaignQueue::Outcome::Disabled && !fourth.first_refusal);
+	CHECK(starts == 1);
+	CHECK(!queue.PendingForTest());
+	Request out;
+	CHECK(!queue.Next(&out)); // returns at once: disabled
+}
+
+// The worker refuses on the disabled flag alone, even with a request pending.
+void TestNextRefusesWhenDisabled() {
+	using namespace Sampler;
+	CampaignQueue queue;
+	Request       join;
+	CHECK(queue.Submit(join, [] {}).outcome == CampaignQueue::Outcome::Queued);
+	queue.ForceDisabledKeepingRequestForTest();
+	CHECK(queue.PendingForTest());
+	Request out;
+	CHECK(!queue.Next(&out));
+	CHECK(!queue.PendingForTest());
+	const auto before = std::chrono::steady_clock::now();
+	CHECK(!queue.WaitUntil(before + std::chrono::seconds(2))); // returns at once, not at 2 s
+	CHECK(std::chrono::steady_clock::now() - before < std::chrono::seconds(1));
+	CHECK(std::string(queue.Interruption()) == "sampling_disabled");
+}
+
+// What the queue still does in normal operation.
+void TestCampaignQueueBasics() {
+	using namespace Sampler;
+	CampaignQueue queue;
+	int           starts = 0;
+	const auto    start  = [&] { starts++; };
+	Request       join;
+	for (uint32_t i = 1; i <= MaxCampaigns; i++) {
+		const auto result = queue.Submit(join, start);
+		CHECK(result.outcome == CampaignQueue::Outcome::Queued && result.campaign == i);
+	}
+	CHECK(starts == 1);
+	Request out;
+	CHECK(queue.Next(&out) && out.campaign == MaxCampaigns); // a newer join replaces the pending one
+	const auto capped = queue.Submit(join, start);
+	CHECK(capped.outcome == CampaignQueue::Outcome::CapReached && capped.first_refusal);
+	CHECK(!queue.Submit(join, start).first_refusal);
+	// An uninterrupted wait runs to its deadline.
+	CHECK(queue.WaitUntil(std::chrono::steady_clock::now() + std::chrono::milliseconds(10)));
+	// A newer join interrupts a campaign's wait.
+	CampaignQueue other;
+	CHECK(other.Submit(join, [] {}).outcome == CampaignQueue::Outcome::Queued);
+	CHECK(other.Next(&out));
+	std::thread joiner([&] {
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		other.Submit(join, [] {});
+	});
+	CHECK(!other.WaitUntil(std::chrono::steady_clock::now() + std::chrono::seconds(30)));
+	joiner.join();
+	CHECK(std::string(other.Interruption()) == "superseded_by_next_join");
+	// Shutdown.
+	queue.Stop();
+	CHECK(!queue.Next(&out));
+	CHECK(queue.Submit(join, start).outcome == CampaignQueue::Outcome::Stopping);
+	CHECK(std::string(queue.Interruption()) == "stopping");
+}
+
 void TestBounds() {
 	using namespace Sampler;
 	uint32_t previous = 0;
@@ -672,6 +833,9 @@ int main() {
 	TestTopKeys();
 	TestResumeWithRetry();
 	TestSummarizePauses();
+	TestQueuedCampaignDroppedOnResumeFailure();
+	TestNextRefusesWhenDisabled();
+	TestCampaignQueueBasics();
 	TestBounds();
 	if (g_failures != 0) {
 		std::printf("stall probe tests: %d failed\n", g_failures);

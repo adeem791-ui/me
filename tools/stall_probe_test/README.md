@@ -40,8 +40,11 @@ g++ -std=c++20 -Wall -Wextra -Werror -Wformat=2 -g -O1 -fsanitize=address,undefi
 | `TestTopKeys` | commonest first, ties in first-seen order |
 | `TestResumeWithRetry` | success on the first call; two failures then success resumes exactly once; constant failure stops after the allowed attempts with the last error |
 | `TestSummarizePauses` | minimum, median (odd and even counts), maximum, total; empty input |
+| `TestQueuedCampaignDroppedOnResumeFailure` | a join queued during a burst whose resume fails every retry: the queued campaign is dropped, the worker stops by itself, the thread is never sampled again, the retry count is unchanged, the failure is logged only after sampling is disabled and with the queue's lock free; later joins are refused (reported once) and no worker restarts |
+| `TestNextRefusesWhenDisabled` | the worker refuses to start a campaign on the disabled flag alone, even with a request pending; a wait returns at once |
+| `TestCampaignQueueBasics` | normal operation after the refactor: a newer join replaces the pending one, one worker start, campaign cap reported once, a newer join interrupts a wait, shutdown |
 | `TestBounds` | burst schedule ascending and within 30 minutes; samples and log lines per campaign bounded |
 
-Also run with `-fsanitize=thread` (GCC) and with clang `-O2`; both pass. A mutation check (12 deliberate
-bugs in the tracker, call decoding, export parsing, stack scan, verdicts, resume retry and pause
-summary) fails the tests every time.
+Also run with `-fsanitize=thread` (GCC) and with clang `-O2`; both pass. A mutation check (18 deliberate
+bugs in the tracker, call decoding, export parsing, stack scan, verdicts, resume retry, pause
+summary and the resume-failure stop) fails the tests every time.

@@ -8,8 +8,8 @@ do the long `wait_reg_mem` stalls wait for?
 timing that the game can observe beyond the pauses described under *Cost*, and no error handling.
 
 **Base:** upstream `9dcff95` + `01-16` + `17` + `18` (revision 3), the exact source of build #34
-(source tree `07e954ad`). `patches/20-stall-probe.patch` (revision 2) is the only addition; with it
-the source tree is `01181162`. It does not need or include patch 19.
+(source tree `07e954ad`). `patches/20-stall-probe.patch` (revision 3) is the only addition; with it
+the source tree is `6e7e5d3c`. It does not need or include patch 19.
 
 ## Switches
 
@@ -159,11 +159,14 @@ confirm or overturn it.
   `already_suspended` counts samples where the thread was already suspended by something else.
 - **Every `ResumeThread` is checked.** A failure is retried up to 4 times (a failed call leaves the
   suspend count unchanged, so a later success resumes exactly once; `resume_retries` counts
-  retries). If all fail, the sampler does nothing else that could need a lock the frozen thread
-  holds: it logs one `ResumeThread FAILED` line, ends the campaign with `reason=resume_failed`, and
-  samples nothing more for the rest of the run. If that thread was frozen holding the logger's
-  lock, the line cannot appear; the log would then stop at the last sample line while the game
-  hangs, with the external monitor showing the main thread at 0% CPU.
+  retries). If all fail, the sampler first, in one step under its own lock, disables sampling for
+  the rest of the run and drops any campaign a newer join has queued; only then, with that lock
+  released, does it log one `ResumeThread FAILED` line (`queued_campaign_dropped=1` if one was
+  dropped) and end the campaign with `reason=resume_failed`. The worker checks the disabled state
+  before starting any campaign, and later joins are refused (`not sampled: sampling stopped
+  earlier`), so nothing samples the thread again even if that log call never returns. It never
+  returns only if the frozen thread holds the logger's lock; the log would then stop at the last
+  sample line while the game hangs, with the external monitor showing the main thread at 0% CPU.
 - While it is suspended the sampler only makes system calls: no allocation, no lock, no logging, so
   it cannot deadlock on a lock the main thread holds. Memory is read with `ReadProcessMemory` after
   `VirtualQuery`; guard pages and no-access pages are skipped, so the read cannot fault, cannot
